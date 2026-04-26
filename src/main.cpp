@@ -16,6 +16,7 @@ constexpr wchar_t kLegacySection[] = L"Sticker";
 constexpr UINT kMsgEndEdit = WM_APP + 1;
 constexpr int kResizeBorder = 8;
 constexpr COLORREF kTransparentKeyColor = RGB(1, 2, 3);
+constexpr UINT kMaxStickerCount = 1024;
 
 constexpr UINT kMenuEditId = 1001;
 constexpr UINT kMenuExitId = 1002;
@@ -51,6 +52,8 @@ enum class FontSize : int {
     Medium = 1,
     Large = 2,
 };
+
+constexpr int kMaxFontSizeIndex = static_cast<int>(FontSize::Large);
 
 struct StickerState {
     HWND hwnd = nullptr;
@@ -242,10 +245,10 @@ std::wstring StickerSectionName(int index) {
 void LoadState() {
     g_app.iniPath = GetIniPath();
 
-    const int count = static_cast<int>(GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str()));
+    const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
     g_app.stickers.clear();
 
-    if (count <= 0) {
+    if (count == 0 || count > kMaxStickerCount) {
         StickerState legacy = MakeDefaultSticker();
         legacy.x = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", legacy.x, g_app.iniPath.c_str()));
         legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, g_app.iniPath.c_str()));
@@ -260,9 +263,9 @@ void LoadState() {
         return;
     }
 
-    for (int i = 0; i < count; ++i) {
+    for (UINT i = 0; i < count; ++i) {
         StickerState sticker = MakeDefaultSticker();
-        const std::wstring section = StickerSectionName(i);
+        const std::wstring section = StickerSectionName(static_cast<int>(i));
         sticker.x = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"x", sticker.x, g_app.iniPath.c_str()));
         sticker.y = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"y", sticker.y, g_app.iniPath.c_str()));
         sticker.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"w", sticker.w, g_app.iniPath.c_str())), 140);
@@ -299,9 +302,10 @@ void SaveAllState() {
         UpdatePositionFromWindow(sticker);
     }
 
-    const int oldCount = static_cast<int>(GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str()));
-    for (int i = 0; i < oldCount; ++i) {
-        const std::wstring section = StickerSectionName(i);
+    const UINT oldCount = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
+    const UINT cleanupCount = std::min(oldCount, kMaxStickerCount);
+    for (UINT i = 0; i < cleanupCount; ++i) {
+        const std::wstring section = StickerSectionName(static_cast<int>(i));
         WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, g_app.iniPath.c_str());
     }
     WritePrivateProfileStringW(kLegacySection, nullptr, nullptr, g_app.iniPath.c_str());
@@ -537,7 +541,7 @@ POINT PointFromLParam(LPARAM lParam) {
 
 void AdjustSizeChoice(StickerState& sticker, int delta) {
     int index = ToFontSizeInt(sticker.fontSize);
-    index = std::clamp(index + delta, 0, 2);
+    index = std::clamp(index + delta, 0, kMaxFontSizeIndex);
     const FontSize newSize = ParseFontSize(index);
     if (newSize == sticker.fontSize) {
         return;
