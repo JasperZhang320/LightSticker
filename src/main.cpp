@@ -3,6 +3,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <vector>
 #include <string>
 
 namespace {
@@ -30,7 +31,7 @@ StickerState g_state;
 
 std::wstring EscapeIniValue(const std::wstring& value) {
     std::wstring escaped;
-    escaped.reserve(value.size());
+    escaped.reserve(value.size() * 2);
     for (wchar_t ch : value) {
         if (ch == L'\\') {
             escaped += L"\\\\";
@@ -180,10 +181,9 @@ void EndEdit(bool save) {
 
     if (save) {
         const int len = GetWindowTextLengthW(g_state.edit);
-        std::wstring buffer(static_cast<size_t>(len) + 1, L'\0');
+        std::vector<wchar_t> buffer(static_cast<size_t>(len) + 1, L'\0');
         GetWindowTextW(g_state.edit, buffer.data(), len + 1);
-        buffer.resize(static_cast<size_t>(len));
-        g_state.text = buffer;
+        g_state.text.assign(buffer.data(), static_cast<size_t>(len));
     }
 
     DestroyWindow(g_state.edit);
