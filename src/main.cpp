@@ -209,7 +209,8 @@ void BeginEdit() {
         return;
     }
 
-    g_state.editOrigProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(EditProc)));
+    const LONG_PTR oldProc = SetWindowLongPtrW(g_state.edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(EditProc));
+    g_state.editOrigProc = reinterpret_cast<WNDPROC>(oldProc);
     SendMessageW(g_state.edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     SendMessageW(g_state.edit, EM_SETSEL, 0, -1);
     SetFocus(g_state.edit);
@@ -230,6 +231,13 @@ int HitTestResize(const RECT& rect, const POINT& pt) {
     if (top) return HTTOP;
     if (bottom) return HTBOTTOM;
     return HTCAPTION;
+}
+
+POINT PointFromLParam(LPARAM lParam) {
+    POINT pt {};
+    pt.x = GET_X_LPARAM(lParam);
+    pt.y = GET_Y_LPARAM(lParam);
+    return pt;
 }
 
 void ShowContextMenu(HWND hwnd, POINT pt) {
@@ -259,7 +267,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_state.edit != nullptr) {
             return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
-        POINT pt { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        POINT pt = PointFromLParam(lParam);
         RECT rect {};
         GetWindowRect(hwnd, &rect);
         return HitTestResize(rect, pt);
@@ -283,7 +291,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         BeginEdit();
         return 0;
     case WM_RBUTTONUP: {
-        POINT pt { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        POINT pt = PointFromLParam(lParam);
         ClientToScreen(hwnd, &pt);
         ShowContextMenu(hwnd, pt);
         return 0;

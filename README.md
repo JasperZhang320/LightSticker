@@ -2,6 +2,8 @@
 
 LightSticker 是一个基于原生 Win32 C++（MSVC）的轻量级桌面层贴纸程序，窗口挂靠到 WorkerW 桌面层，而不是普通置顶窗口。
 
+LightSticker is a lightweight native Win32 C++ desktop-layer sticker app attached to WorkerW (not a normal always-on-top window).
+
 ## 功能
 
 - 启动后创建无边框贴纸窗口，挂靠 WorkerW 桌面层
