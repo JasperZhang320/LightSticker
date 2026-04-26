@@ -248,7 +248,12 @@ void LoadState() {
     const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
     g_app.stickers.clear();
 
-    if (count == 0 || count > kMaxStickerCount) {
+    if (count > kMaxStickerCount) {
+        g_app.stickers.push_back(MakeDefaultSticker());
+        return;
+    }
+
+    if (count == 0) {
         StickerState legacy = MakeDefaultSticker();
         legacy.x = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", legacy.x, g_app.iniPath.c_str()));
         legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, g_app.iniPath.c_str()));
@@ -303,8 +308,7 @@ void SaveAllState() {
     }
 
     const UINT oldCount = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
-    const UINT cleanupCount = std::min(oldCount, kMaxStickerCount);
-    for (UINT i = 0; i < cleanupCount; ++i) {
+    for (UINT i = 0; i < oldCount; ++i) {
         const std::wstring section = StickerSectionName(static_cast<int>(i));
         WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, g_app.iniPath.c_str());
     }
