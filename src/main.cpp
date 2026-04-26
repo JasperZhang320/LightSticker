@@ -372,10 +372,15 @@ StickerState* FindStickerByEdit(HWND edit) {
 }
 
 HFONT CreateStickerFont(const StickerState& sticker, HWND hwnd) {
-    HDC hdc = GetDC(hwnd != nullptr ? hwnd : nullptr);
+    HDC hdc = GetDC(hwnd);
+    bool releaseScreenDc = false;
+    if (hdc == nullptr) {
+        hdc = GetDC(nullptr);
+        releaseScreenDc = true;
+    }
     const int dpi = hdc != nullptr ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
     if (hdc != nullptr) {
-        ReleaseDC(hwnd != nullptr ? hwnd : nullptr, hdc);
+        ReleaseDC(releaseScreenDc ? nullptr : hwnd, hdc);
     }
 
     LOGFONTW lf {};
