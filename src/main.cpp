@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "json_min.h"
+
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"LightStickerMainWindow";
@@ -76,7 +78,8 @@ struct StickerState {
 };
 
 struct AppState {
-    std::wstring iniPath;
+    std::wstring jsonPath;
+    std::wstring iniPath;       // legacy, populated only when migrating
     std::vector<std::unique_ptr<StickerState>> stickers;
     HWND workerw = nullptr;
     UINT taskbarCreatedMsg = 0;
@@ -84,6 +87,78 @@ struct AppState {
 };
 
 AppState g_app;
+
+constexpr int kDataSchemaVersion = 1;
+
+std::string Utf16ToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToUtf16(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                      nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                        out.data(), n);
+    return out;
+}
+
+bool ReadEntireFile(const std::wstring& path, std::string& out) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > (16LL << 20)) {
+        CloseHandle(file);
+        return false;
+    }
+    out.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    BOOL ok = TRUE;
+    if (!out.empty()) {
+        ok = ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    }
+    CloseHandle(file);
+    return ok && read == out.size();
+}
+
+bool WriteEntireFileAtomic(const std::wstring& path, const std::string& content) {
+    const std::wstring tmp = path + L".tmp";
+    HANDLE file = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = TRUE;
+    if (!content.empty()) {
+        ok = WriteFile(file, content.data(), static_cast<DWORD>(content.size()),
+                       &written, nullptr);
+    }
+    CloseHandle(file);
+    if (!ok || written != content.size()) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+bool FileExists(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
 
 std::wstring EscapeIniValue(const std::wstring& value) {
     std::wstring escaped;
@@ -183,6 +258,33 @@ std::wstring GetIniPath() {
     return portablePath;
 }
 
+// Mirrors GetIniPath / GetFallbackIniPath, but for the new JSON store.
+std::wstring GetFallbackJsonPath() {
+    PWSTR localAppData = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &localAppData))) {
+        return std::wstring();
+    }
+    std::wstring dir(localAppData);
+    CoTaskMemFree(localAppData);
+    dir += L"\\LightSticker";
+    if (!EnsureDirectoryExists(dir)) {
+        return std::wstring();
+    }
+    return dir + L"\\settings.json";
+}
+
+std::wstring GetJsonPath() {
+    const std::wstring portablePath = GetModuleDirectory() + L"\\LightSticker.json";
+    if (CanWriteFilePath(portablePath)) {
+        return portablePath;
+    }
+    const std::wstring fallback = GetFallbackJsonPath();
+    if (!fallback.empty() && CanWriteFilePath(fallback)) {
+        return fallback;
+    }
+    return portablePath;
+}
+
 int ClampDimension(int value, int minimum) {
     return std::max(value, minimum);
 }
@@ -267,49 +369,104 @@ std::wstring StickerSectionName(int index) {
     return L"Sticker" + std::to_wstring(index);
 }
 
-void LoadState() {
-    g_app.iniPath = GetIniPath();
+// Reads stickers from a JSON file written by an earlier run. Returns false
+// if the file is missing or unparseable. Populates g_app.stickers on success.
+bool LoadStickersFromJson(const std::wstring& path);
+bool LoadStickersFromIni(const std::wstring& iniPath);
+void SaveAllState();
 
-    const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
+bool LoadStickersFromJson(const std::wstring& path) {
+    if (!FileExists(path)) {
+        return false;
+    }
+    std::string buf;
+    if (!ReadEntireFile(path, buf)) {
+        return false;
+    }
+    json_min::Value root;
+    if (!json_min::parse(buf, root) || root.type != json_min::Value::Type::Obj) {
+        return false;
+    }
+    const json_min::Value* arr = root.find("stickers");
+    if (arr == nullptr || arr->type != json_min::Value::Type::Arr) {
+        return false;
+    }
+
     g_app.stickers.clear();
+    for (const auto& el : arr->a) {
+        if (el.type != json_min::Value::Type::Obj) continue;
+        StickerState sticker = MakeDefaultSticker();
+        if (auto* p = el.find("x"))      sticker.x = static_cast<int>(p->as_int(sticker.x));
+        if (auto* p = el.find("y"))      sticker.y = static_cast<int>(p->as_int(sticker.y));
+        if (auto* p = el.find("w"))      sticker.w = ClampDimension(static_cast<int>(p->as_int(sticker.w)), 140);
+        if (auto* p = el.find("h"))      sticker.h = ClampDimension(static_cast<int>(p->as_int(sticker.h)), 80);
+        if (auto* p = el.find("theme"))  sticker.theme = ParseTheme(static_cast<int>(p->as_int(0)));
+        if (auto* p = el.find("font"))   sticker.fontChoice = ParseFontChoice(static_cast<int>(p->as_int(0)));
+        if (auto* p = el.find("size"))   sticker.fontSize = ParseFontSize(static_cast<int>(p->as_int(1)));
+        if (auto* p = el.find("locked")) sticker.locked = p->as_bool(false);
+        if (auto* p = el.find("text"))   sticker.text = Utf8ToUtf16(p->as_str());
+        ClampToNearestMonitor(sticker);
+        if (g_app.stickers.size() >= kMaxStickerCount) break;
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
+    }
+
+    if (g_app.stickers.empty()) {
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
+    }
+    return true;
+}
+
+// Legacy migration path -- reads from the INI format produced by versions
+// 0.1.x. Returns false if no INI data was discovered.
+bool LoadStickersFromIni(const std::wstring& iniPath) {
+    if (!FileExists(iniPath)) {
+        return false;
+    }
+    const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, iniPath.c_str());
 
     if (count > kMaxStickerCount) {
-        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
-        ClampToNearestMonitor(*g_app.stickers.back());
-        return;
+        return false;
     }
 
     if (count == 0) {
+        // Try the very-first-version single-sticker layout under [Sticker].
+        const int sentinel = -999999;
+        const int probe = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", sentinel, iniPath.c_str()));
+        if (probe == sentinel) {
+            return false;
+        }
         StickerState legacy = MakeDefaultSticker();
-        legacy.x = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", legacy.x, g_app.iniPath.c_str()));
-        legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, g_app.iniPath.c_str()));
-        legacy.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"w", legacy.w, g_app.iniPath.c_str())), 140);
-        legacy.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"h", legacy.h, g_app.iniPath.c_str())), 80);
+        legacy.x = probe;
+        legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, iniPath.c_str()));
+        legacy.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"w", legacy.w, iniPath.c_str())), 140);
+        legacy.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"h", legacy.h, iniPath.c_str())), 80);
 
         wchar_t textBuf[8192] = {};
         GetPrivateProfileStringW(kLegacySection, L"text", legacy.text.c_str(), textBuf,
-                                 static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
+                                 static_cast<DWORD>(std::size(textBuf)), iniPath.c_str());
         legacy.text = UnescapeIniValue(textBuf);
         ClampToNearestMonitor(legacy);
+        g_app.stickers.clear();
         g_app.stickers.push_back(std::make_unique<StickerState>(std::move(legacy)));
-        return;
+        return true;
     }
 
+    g_app.stickers.clear();
     for (UINT i = 0; i < count; ++i) {
         StickerState sticker = MakeDefaultSticker();
         const std::wstring section = StickerSectionName(static_cast<int>(i));
-        sticker.x = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"x", sticker.x, g_app.iniPath.c_str()));
-        sticker.y = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"y", sticker.y, g_app.iniPath.c_str()));
-        sticker.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"w", sticker.w, g_app.iniPath.c_str())), 140);
-        sticker.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"h", sticker.h, g_app.iniPath.c_str())), 80);
-        sticker.theme = ParseTheme(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"theme", 0, g_app.iniPath.c_str())));
-        sticker.fontChoice = ParseFontChoice(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"font", 0, g_app.iniPath.c_str())));
-        sticker.fontSize = ParseFontSize(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"size", 1, g_app.iniPath.c_str())));
-        sticker.locked = GetPrivateProfileIntW(section.c_str(), L"locked", 0, g_app.iniPath.c_str()) != 0;
+        sticker.x = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"x", sticker.x, iniPath.c_str()));
+        sticker.y = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"y", sticker.y, iniPath.c_str()));
+        sticker.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"w", sticker.w, iniPath.c_str())), 140);
+        sticker.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"h", sticker.h, iniPath.c_str())), 80);
+        sticker.theme = ParseTheme(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"theme", 0, iniPath.c_str())));
+        sticker.fontChoice = ParseFontChoice(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"font", 0, iniPath.c_str())));
+        sticker.fontSize = ParseFontSize(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"size", 1, iniPath.c_str())));
+        sticker.locked = GetPrivateProfileIntW(section.c_str(), L"locked", 0, iniPath.c_str()) != 0;
 
         wchar_t textBuf[8192] = {};
         GetPrivateProfileStringW(section.c_str(), L"text", sticker.text.c_str(), textBuf,
-                                 static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
+                                 static_cast<DWORD>(std::size(textBuf)), iniPath.c_str());
         sticker.text = UnescapeIniValue(textBuf);
         ClampToNearestMonitor(sticker);
         g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
@@ -318,6 +475,28 @@ void LoadState() {
     if (g_app.stickers.empty()) {
         g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
     }
+    return true;
+}
+
+void LoadState() {
+    g_app.jsonPath = GetJsonPath();
+
+    if (LoadStickersFromJson(g_app.jsonPath)) {
+        return;
+    }
+
+    // Migration: if the user is upgrading from an earlier version that wrote
+    // INI, pull data from there once and then save as JSON. We keep the .ini
+    // file on disk as a safety backup; subsequent saves only touch JSON.
+    g_app.iniPath = GetIniPath();
+    if (LoadStickersFromIni(g_app.iniPath)) {
+        // Persist immediately so the next launch reads JSON directly.
+        SaveAllState();
+        return;
+    }
+    // Fresh start.
+    g_app.stickers.clear();
+    g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
 }
 
 void UpdatePositionFromWindow(StickerState& sticker) {
@@ -331,34 +510,35 @@ void UpdatePositionFromWindow(StickerState& sticker) {
 }
 
 void SaveAllState() {
+    if (g_app.jsonPath.empty()) {
+        g_app.jsonPath = GetJsonPath();
+    }
     for (auto& sticker : g_app.stickers) {
         UpdatePositionFromWindow(*sticker);
     }
 
-    const UINT oldCount = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
-    for (UINT i = 0; i < oldCount; ++i) {
-        const std::wstring section = StickerSectionName(static_cast<int>(i));
-        WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, g_app.iniPath.c_str());
+    json_min::Value root = json_min::Value::make_obj();
+    root["version"] = json_min::Value::make_int(kDataSchemaVersion);
+
+    json_min::Value arr = json_min::Value::make_arr();
+    for (const auto& up : g_app.stickers) {
+        const StickerState& s = *up;
+        json_min::Value obj = json_min::Value::make_obj();
+        obj["x"]      = json_min::Value::make_int(s.x);
+        obj["y"]      = json_min::Value::make_int(s.y);
+        obj["w"]      = json_min::Value::make_int(s.w);
+        obj["h"]      = json_min::Value::make_int(s.h);
+        obj["theme"]  = json_min::Value::make_int(ToThemeInt(s.theme));
+        obj["font"]   = json_min::Value::make_int(ToFontChoiceInt(s.fontChoice));
+        obj["size"]   = json_min::Value::make_int(ToFontSizeInt(s.fontSize));
+        obj["locked"] = json_min::Value::make_bool(s.locked);
+        obj["text"]   = json_min::Value::make_str(Utf16ToUtf8(s.text));
+        arr.a.push_back(std::move(obj));
     }
-    WritePrivateProfileStringW(kLegacySection, nullptr, nullptr, g_app.iniPath.c_str());
+    root["stickers"] = std::move(arr);
 
-    WritePrivateProfileStringW(kGeneralSection, L"StickerCount", std::to_wstring(g_app.stickers.size()).c_str(), g_app.iniPath.c_str());
-
-    for (size_t i = 0; i < g_app.stickers.size(); ++i) {
-        const StickerState& sticker = *g_app.stickers[i];
-        const std::wstring section = StickerSectionName(static_cast<int>(i));
-
-        WritePrivateProfileStringW(section.c_str(), L"x", std::to_wstring(sticker.x).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"y", std::to_wstring(sticker.y).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"w", std::to_wstring(sticker.w).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"h", std::to_wstring(sticker.h).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"theme", std::to_wstring(ToThemeInt(sticker.theme)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"font", std::to_wstring(ToFontChoiceInt(sticker.fontChoice)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"size", std::to_wstring(ToFontSizeInt(sticker.fontSize)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"locked", sticker.locked ? L"1" : L"0", g_app.iniPath.c_str());
-        const std::wstring escaped = EscapeIniValue(sticker.text);
-        WritePrivateProfileStringW(section.c_str(), L"text", escaped.c_str(), g_app.iniPath.c_str());
-    }
+    const std::string text = json_min::write(root, /*pretty=*/true);
+    WriteEntireFileAtomic(g_app.jsonPath, text);
 }
 
 HWND FindWorkerW() {
