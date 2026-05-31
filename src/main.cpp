@@ -19,8 +19,21 @@ constexpr wchar_t kHookWindowClassName[] = L"LightStickerShellHookWindow";
 constexpr wchar_t kGeneralSection[] = L"General";
 constexpr wchar_t kLegacySection[] = L"Sticker";
 constexpr UINT kMsgEndEdit = WM_APP + 1;
+constexpr UINT kMsgTrayCallback = WM_APP + 2;
 constexpr int kResizeBorder = 8;
 constexpr UINT kMaxStickerCount = 1024;
+
+// Tray icon menu IDs.
+constexpr UINT kTrayMenuNewId        = 2001;
+constexpr UINT kTrayMenuLockAllId    = 2002;
+constexpr UINT kTrayMenuShowAllId    = 2003;
+constexpr UINT kTrayMenuSaveId       = 2004;
+constexpr UINT kTrayMenuExitId       = 2005;
+
+// Global hotkey: Ctrl+Alt+N spawns a sticker at the cursor position.
+constexpr int  kHotkeyIdNewSticker   = 1;
+constexpr UINT kHotkeyMods           = MOD_CONTROL | MOD_ALT;
+constexpr UINT kHotkeyVk             = 'N';
 
 constexpr UINT kMenuEditId = 1001;
 constexpr UINT kMenuExitId = 1002;
@@ -103,8 +116,12 @@ struct AppState {
     std::wstring iniPath;       // legacy, populated only when migrating
     std::vector<std::unique_ptr<StickerState>> stickers;
     HWND workerw = nullptr;
+    HWND hookHwnd = nullptr;
+    HINSTANCE instance = nullptr;
     UINT taskbarCreatedMsg = 0;
     bool exiting = false;
+    bool trayInstalled = false;
+    bool hotkeyRegistered = false;
 };
 
 AppState g_app;
@@ -395,6 +412,7 @@ std::wstring StickerSectionName(int index) {
 bool LoadStickersFromJson(const std::wstring& path);
 bool LoadStickersFromIni(const std::wstring& iniPath);
 void SaveAllState();
+void BeginExitAll();
 
 bool LoadStickersFromJson(const std::wstring& path) {
     if (!FileExists(path)) {
@@ -1019,10 +1037,172 @@ void RefreshAndReattachAll() {
     }
 }
 
+// Returns the StickerState* pushed back, or nullptr on failure.
+StickerState* SpawnStickerAtCursor() {
+    if (g_app.instance == nullptr) return nullptr;
+    if (g_app.stickers.size() >= kMaxStickerCount) return nullptr;
+
+    auto created = std::make_unique<StickerState>(MakeDefaultSticker());
+    POINT pt{};
+    if (GetCursorPos(&pt)) {
+        created->x = pt.x - created->w / 2;
+        created->y = pt.y - created->h / 2;
+    }
+    ClampToNearestMonitor(*created);
+    StickerState* p = created.get();
+    g_app.stickers.push_back(std::move(created));
+    if (!CreateStickerWindow(*p, g_app.instance)) {
+        g_app.stickers.pop_back();
+        return nullptr;
+    }
+    SaveAllState();
+    return p;
+}
+
+bool AllStickersLocked() {
+    if (g_app.stickers.empty()) return false;
+    for (const auto& s : g_app.stickers) {
+        if (!s->locked) return false;
+    }
+    return true;
+}
+
+void SetAllLocked(bool locked) {
+    for (auto& s : g_app.stickers) {
+        if (s->locked != locked) {
+            s->locked = locked;
+            if (locked) {
+                EndEdit(*s, true);
+            }
+            RequestRepaint(*s);
+        }
+    }
+    SaveAllState();
+}
+
+void ShowTrayMenu(HWND owner) {
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) return;
+
+    AppendMenuW(menu, MF_STRING, kTrayMenuNewId,    L"&New sticker at cursor\tCtrl+Alt+N");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const bool allLocked = AllStickersLocked();
+    AppendMenuW(menu, MF_STRING, kTrayMenuLockAllId,
+                allLocked ? L"&Unlock all stickers" : L"&Lock all stickers");
+    AppendMenuW(menu, MF_STRING, kTrayMenuShowAllId, L"&Re-pin to desktop");
+    AppendMenuW(menu, MF_STRING, kTrayMenuSaveId,    L"&Save now");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayMenuExitId,    L"E&xit LightSticker");
+
+    SetMenuDefaultItem(menu, kTrayMenuNewId, FALSE);
+
+    POINT pt{};
+    GetCursorPos(&pt);
+
+    // Required so the popup dismisses when the user clicks elsewhere.
+    SetForegroundWindow(owner);
+
+    const UINT cmd = TrackPopupMenu(menu,
+        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x, pt.y, 0, owner, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd != 0) {
+        SendMessageW(owner, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+    }
+}
+
+void InstallTrayIcon(HWND owner) {
+    if (g_app.trayInstalled || owner == nullptr) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize           = sizeof(nid);
+    nid.hWnd             = owner;
+    nid.uID              = 1;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = kMsgTrayCallback;
+    nid.hIcon            = LoadIconW(nullptr, IDI_APPLICATION);
+    lstrcpynW(nid.szTip, L"LightSticker", static_cast<int>(std::size(nid.szTip)));
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        g_app.trayInstalled = true;
+    }
+}
+
+void RemoveTrayIcon(HWND owner) {
+    if (!g_app.trayInstalled || owner == nullptr) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = owner;
+    nid.uID    = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    g_app.trayInstalled = false;
+}
+
+void RegisterGlobalHotkey(HWND owner) {
+    if (g_app.hotkeyRegistered || owner == nullptr) return;
+    if (RegisterHotKey(owner, kHotkeyIdNewSticker, kHotkeyMods, kHotkeyVk)) {
+        g_app.hotkeyRegistered = true;
+    }
+    // Failure is silent: another process may have grabbed Ctrl+Alt+N. The
+    // tray menu still works so the feature degrades gracefully.
+}
+
+void UnregisterGlobalHotkey(HWND owner) {
+    if (!g_app.hotkeyRegistered || owner == nullptr) return;
+    UnregisterHotKey(owner, kHotkeyIdNewSticker);
+    g_app.hotkeyRegistered = false;
+}
+
 LRESULT CALLBACK ShellHookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_app.taskbarCreatedMsg != 0 && msg == g_app.taskbarCreatedMsg) {
         RefreshAndReattachAll();
+        // Explorer restart wipes our tray icon; reinstall it.
+        if (g_app.trayInstalled) {
+            g_app.trayInstalled = false;  // force NIM_ADD again
+            InstallTrayIcon(hwnd);
+        }
         return 0;
+    }
+
+    switch (msg) {
+    case kMsgTrayCallback: {
+        const UINT event = LOWORD(lParam);
+        if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
+            ShowTrayMenu(hwnd);
+        } else if (event == WM_LBUTTONDBLCLK) {
+            SpawnStickerAtCursor();
+        }
+        return 0;
+    }
+    case WM_HOTKEY:
+        if (wParam == kHotkeyIdNewSticker) {
+            SpawnStickerAtCursor();
+        }
+        return 0;
+    case WM_COMMAND: {
+        const UINT cmd = LOWORD(wParam);
+        switch (cmd) {
+        case kTrayMenuNewId:
+            SpawnStickerAtCursor();
+            break;
+        case kTrayMenuLockAllId:
+            SetAllLocked(!AllStickersLocked());
+            break;
+        case kTrayMenuShowAllId:
+            RefreshAndReattachAll();
+            break;
+        case kTrayMenuSaveId:
+            SaveAllState();
+            break;
+        case kTrayMenuExitId:
+            BeginExitAll();
+            break;
+        default:
+            break;
+        }
+        return 0;
+    }
+    default:
+        break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -1494,6 +1674,8 @@ bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    g_app.instance = instance;
+
     // Best-effort: declare PerMonitor V2 DPI awareness at runtime as well.
     // The embedded manifest is the canonical declaration; this is a fallback
     // for environments where the manifest was stripped or is not honored.
@@ -1545,6 +1727,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     HWND hookWindow = CreateWindowExW(
         WS_EX_TOOLWINDOW, kHookWindowClassName, L"", WS_OVERLAPPED,
         0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    g_app.hookHwnd = hookWindow;
     if (hookWindow != nullptr && g_app.taskbarCreatedMsg != 0) {
         // Required so we receive the broadcast even when running elevated
         // alongside a non-elevated Explorer (UIPI).
@@ -1576,11 +1759,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // Tray icon + global hotkey are owned by the hidden hook window so they
+    // outlive any individual sticker.
+    InstallTrayIcon(g_app.hookHwnd);
+    RegisterGlobalHotkey(g_app.hookHwnd);
+
     MSG msg {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    UnregisterGlobalHotkey(g_app.hookHwnd);
+    RemoveTrayIcon(g_app.hookHwnd);
     D2DShutdown();
     return static_cast<int>(msg.wParam);
 }
