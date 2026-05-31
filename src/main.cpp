@@ -5,17 +5,21 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "d2d_renderer.h"
+#include "json_min.h"
 
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"LightStickerMainWindow";
+constexpr wchar_t kHookWindowClassName[] = L"LightStickerShellHookWindow";
 constexpr wchar_t kGeneralSection[] = L"General";
 constexpr wchar_t kLegacySection[] = L"Sticker";
 constexpr UINT kMsgEndEdit = WM_APP + 1;
 constexpr int kResizeBorder = 8;
-constexpr COLORREF kTransparentKeyColor = RGB(1, 2, 3);
 constexpr UINT kMaxStickerCount = 1024;
 
 constexpr UINT kMenuEditId = 1001;
@@ -36,6 +40,11 @@ constexpr UINT kMenuSizeSmallId = 1301;
 constexpr UINT kMenuSizeMediumId = 1302;
 constexpr UINT kMenuSizeLargeId = 1303;
 
+// Reserved range for dynamically-loaded theme packs (themes/*.json).
+// 1500..1599 gives room for ~100 packs, which is plenty.
+constexpr UINT kMenuThemePackBaseId  = 1500;
+constexpr UINT kMenuThemePackMaxId   = 1599;
+
 enum class Theme : int {
     Default = 0,
     Miku = 1,
@@ -55,11 +64,20 @@ enum class FontSize : int {
 
 constexpr int kMaxFontSizeIndex = static_cast<int>(FontSize::Large);
 
+constexpr int kDefaultOpacityPercent = 100;
+constexpr int kMinOpacityPercent     = 20;
+constexpr int kDefaultCornerRadius   = 12;
+constexpr int kMaxCornerRadius       = 48;
+constexpr int kCustomColorUnset      = -1;
+
 struct StickerState {
     HWND hwnd = nullptr;
     HWND edit = nullptr;
     WNDPROC editOrigProc = nullptr;
     HFONT font = nullptr;
+    HBRUSH editBgBrush = nullptr;
+
+    StickerRenderer renderer;
 
     std::wstring text = L"Double-click to edit";
     int x = 120;
@@ -71,16 +89,97 @@ struct StickerState {
     FontChoice fontChoice = FontChoice::Default;
     FontSize fontSize = FontSize::Medium;
     bool locked = false;
+
+    // -1 means "follow theme"; otherwise a 0x00RRGGBB COLORREF.
+    int customBgColor   = kCustomColorUnset;
+    int customTextColor = kCustomColorUnset;
+
+    int opacityPercent = kDefaultOpacityPercent;   // 20..100
+    int cornerRadius   = kDefaultCornerRadius;     // 0..48 in DIPs
 };
 
 struct AppState {
-    std::wstring iniPath;
-    std::vector<StickerState> stickers;
+    std::wstring jsonPath;
+    std::wstring iniPath;       // legacy, populated only when migrating
+    std::vector<std::unique_ptr<StickerState>> stickers;
     HWND workerw = nullptr;
+    UINT taskbarCreatedMsg = 0;
     bool exiting = false;
 };
 
 AppState g_app;
+
+constexpr int kDataSchemaVersion = 1;
+
+std::string Utf16ToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToUtf16(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                      nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                        out.data(), n);
+    return out;
+}
+
+bool ReadEntireFile(const std::wstring& path, std::string& out) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > (16LL << 20)) {
+        CloseHandle(file);
+        return false;
+    }
+    out.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    BOOL ok = TRUE;
+    if (!out.empty()) {
+        ok = ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    }
+    CloseHandle(file);
+    return ok && read == out.size();
+}
+
+bool WriteEntireFileAtomic(const std::wstring& path, const std::string& content) {
+    const std::wstring tmp = path + L".tmp";
+    HANDLE file = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = TRUE;
+    if (!content.empty()) {
+        ok = WriteFile(file, content.data(), static_cast<DWORD>(content.size()),
+                       &written, nullptr);
+    }
+    CloseHandle(file);
+    if (!ok || written != content.size()) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+bool FileExists(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
 
 std::wstring EscapeIniValue(const std::wstring& value) {
     std::wstring escaped;
@@ -180,6 +279,33 @@ std::wstring GetIniPath() {
     return portablePath;
 }
 
+// Mirrors GetIniPath / GetFallbackIniPath, but for the new JSON store.
+std::wstring GetFallbackJsonPath() {
+    PWSTR localAppData = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &localAppData))) {
+        return std::wstring();
+    }
+    std::wstring dir(localAppData);
+    CoTaskMemFree(localAppData);
+    dir += L"\\LightSticker";
+    if (!EnsureDirectoryExists(dir)) {
+        return std::wstring();
+    }
+    return dir + L"\\settings.json";
+}
+
+std::wstring GetJsonPath() {
+    const std::wstring portablePath = GetModuleDirectory() + L"\\LightSticker.json";
+    if (CanWriteFilePath(portablePath)) {
+        return portablePath;
+    }
+    const std::wstring fallback = GetFallbackJsonPath();
+    if (!fallback.empty() && CanWriteFilePath(fallback)) {
+        return fallback;
+    }
+    return portablePath;
+}
+
 int ClampDimension(int value, int minimum) {
     return std::max(value, minimum);
 }
@@ -238,58 +364,179 @@ StickerState MakeDefaultSticker() {
     return sticker;
 }
 
+void ClampToNearestMonitor(StickerState& sticker) {
+    RECT rect{ sticker.x, sticker.y, sticker.x + sticker.w, sticker.y + sticker.h };
+    HMONITOR mon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    if (mon == nullptr) {
+        return;
+    }
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) {
+        return;
+    }
+    const RECT& wa = mi.rcWork;
+    const int waW = wa.right - wa.left;
+    const int waH = wa.bottom - wa.top;
+    sticker.w = std::min(sticker.w, std::max(waW, 140));
+    sticker.h = std::min(sticker.h, std::max(waH, 80));
+    if (sticker.x + sticker.w > wa.right)  sticker.x = wa.right  - sticker.w;
+    if (sticker.y + sticker.h > wa.bottom) sticker.y = wa.bottom - sticker.h;
+    if (sticker.x < wa.left) sticker.x = wa.left;
+    if (sticker.y < wa.top)  sticker.y = wa.top;
+}
+
 std::wstring StickerSectionName(int index) {
     return L"Sticker" + std::to_wstring(index);
 }
 
-void LoadState() {
-    g_app.iniPath = GetIniPath();
+// Reads stickers from a JSON file written by an earlier run. Returns false
+// if the file is missing or unparseable. Populates g_app.stickers on success.
+bool LoadStickersFromJson(const std::wstring& path);
+bool LoadStickersFromIni(const std::wstring& iniPath);
+void SaveAllState();
 
-    const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
+bool LoadStickersFromJson(const std::wstring& path) {
+    if (!FileExists(path)) {
+        return false;
+    }
+    std::string buf;
+    if (!ReadEntireFile(path, buf)) {
+        return false;
+    }
+    json_min::Value root;
+    if (!json_min::parse(buf, root) || root.type != json_min::Value::Type::Obj) {
+        return false;
+    }
+    const json_min::Value* arr = root.find("stickers");
+    if (arr == nullptr || arr->type != json_min::Value::Type::Arr) {
+        return false;
+    }
+
     g_app.stickers.clear();
-
-    if (count > kMaxStickerCount) {
-        g_app.stickers.push_back(MakeDefaultSticker());
-        return;
-    }
-
-    if (count == 0) {
-        StickerState legacy = MakeDefaultSticker();
-        legacy.x = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", legacy.x, g_app.iniPath.c_str()));
-        legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, g_app.iniPath.c_str()));
-        legacy.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"w", legacy.w, g_app.iniPath.c_str())), 140);
-        legacy.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"h", legacy.h, g_app.iniPath.c_str())), 80);
-
-        wchar_t textBuf[8192] = {};
-        GetPrivateProfileStringW(kLegacySection, L"text", legacy.text.c_str(), textBuf,
-                                 static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
-        legacy.text = UnescapeIniValue(textBuf);
-        g_app.stickers.push_back(std::move(legacy));
-        return;
-    }
-
-    for (UINT i = 0; i < count; ++i) {
+    for (const auto& el : arr->a) {
+        if (el.type != json_min::Value::Type::Obj) continue;
         StickerState sticker = MakeDefaultSticker();
-        const std::wstring section = StickerSectionName(static_cast<int>(i));
-        sticker.x = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"x", sticker.x, g_app.iniPath.c_str()));
-        sticker.y = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"y", sticker.y, g_app.iniPath.c_str()));
-        sticker.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"w", sticker.w, g_app.iniPath.c_str())), 140);
-        sticker.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"h", sticker.h, g_app.iniPath.c_str())), 80);
-        sticker.theme = ParseTheme(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"theme", 0, g_app.iniPath.c_str())));
-        sticker.fontChoice = ParseFontChoice(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"font", 0, g_app.iniPath.c_str())));
-        sticker.fontSize = ParseFontSize(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"size", 1, g_app.iniPath.c_str())));
-        sticker.locked = GetPrivateProfileIntW(section.c_str(), L"locked", 0, g_app.iniPath.c_str()) != 0;
-
-        wchar_t textBuf[8192] = {};
-        GetPrivateProfileStringW(section.c_str(), L"text", sticker.text.c_str(), textBuf,
-                                 static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
-        sticker.text = UnescapeIniValue(textBuf);
-        g_app.stickers.push_back(std::move(sticker));
+        if (auto* p = el.find("x"))      sticker.x = static_cast<int>(p->as_int(sticker.x));
+        if (auto* p = el.find("y"))      sticker.y = static_cast<int>(p->as_int(sticker.y));
+        if (auto* p = el.find("w"))      sticker.w = ClampDimension(static_cast<int>(p->as_int(sticker.w)), 140);
+        if (auto* p = el.find("h"))      sticker.h = ClampDimension(static_cast<int>(p->as_int(sticker.h)), 80);
+        if (auto* p = el.find("theme"))  sticker.theme = ParseTheme(static_cast<int>(p->as_int(0)));
+        if (auto* p = el.find("font"))   sticker.fontChoice = ParseFontChoice(static_cast<int>(p->as_int(0)));
+        if (auto* p = el.find("size"))   sticker.fontSize = ParseFontSize(static_cast<int>(p->as_int(1)));
+        if (auto* p = el.find("locked")) sticker.locked = p->as_bool(false);
+        if (auto* p = el.find("text"))   sticker.text = Utf8ToUtf16(p->as_str());
+        // New visual fields (optional; legacy files just inherit theme defaults).
+        if (auto* p = el.find("bgColor")) {
+            const long long v = p->as_int(kCustomColorUnset);
+            sticker.customBgColor = (v >= 0 && v <= 0xFFFFFF) ? static_cast<int>(v) : kCustomColorUnset;
+        }
+        if (auto* p = el.find("textColor")) {
+            const long long v = p->as_int(kCustomColorUnset);
+            sticker.customTextColor = (v >= 0 && v <= 0xFFFFFF) ? static_cast<int>(v) : kCustomColorUnset;
+        }
+        if (auto* p = el.find("opacity")) {
+            sticker.opacityPercent = std::clamp(static_cast<int>(p->as_int(kDefaultOpacityPercent)),
+                                                kMinOpacityPercent, 100);
+        } else {
+            sticker.opacityPercent = GetThemePreset(sticker.theme).opacityPercent;
+        }
+        if (auto* p = el.find("cornerRadius")) {
+            sticker.cornerRadius = std::clamp(static_cast<int>(p->as_int(kDefaultCornerRadius)),
+                                              0, kMaxCornerRadius);
+        }
+        ClampToNearestMonitor(sticker);
+        if (g_app.stickers.size() >= kMaxStickerCount) break;
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
     }
 
     if (g_app.stickers.empty()) {
-        g_app.stickers.push_back(MakeDefaultSticker());
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
     }
+    return true;
+}
+
+// Legacy migration path -- reads from the INI format produced by versions
+// 0.1.x. Returns false if no INI data was discovered.
+bool LoadStickersFromIni(const std::wstring& iniPath) {
+    if (!FileExists(iniPath)) {
+        return false;
+    }
+    const UINT count = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, iniPath.c_str());
+
+    if (count > kMaxStickerCount) {
+        return false;
+    }
+
+    if (count == 0) {
+        // Try the very-first-version single-sticker layout under [Sticker].
+        const int sentinel = -999999;
+        const int probe = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"x", sentinel, iniPath.c_str()));
+        if (probe == sentinel) {
+            return false;
+        }
+        StickerState legacy = MakeDefaultSticker();
+        legacy.x = probe;
+        legacy.y = static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"y", legacy.y, iniPath.c_str()));
+        legacy.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"w", legacy.w, iniPath.c_str())), 140);
+        legacy.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(kLegacySection, L"h", legacy.h, iniPath.c_str())), 80);
+
+        wchar_t textBuf[8192] = {};
+        GetPrivateProfileStringW(kLegacySection, L"text", legacy.text.c_str(), textBuf,
+                                 static_cast<DWORD>(std::size(textBuf)), iniPath.c_str());
+        legacy.text = UnescapeIniValue(textBuf);
+        ClampToNearestMonitor(legacy);
+        g_app.stickers.clear();
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(legacy)));
+        return true;
+    }
+
+    g_app.stickers.clear();
+    for (UINT i = 0; i < count; ++i) {
+        StickerState sticker = MakeDefaultSticker();
+        const std::wstring section = StickerSectionName(static_cast<int>(i));
+        sticker.x = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"x", sticker.x, iniPath.c_str()));
+        sticker.y = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"y", sticker.y, iniPath.c_str()));
+        sticker.w = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"w", sticker.w, iniPath.c_str())), 140);
+        sticker.h = ClampDimension(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"h", sticker.h, iniPath.c_str())), 80);
+        sticker.theme = ParseTheme(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"theme", 0, iniPath.c_str())));
+        sticker.fontChoice = ParseFontChoice(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"font", 0, iniPath.c_str())));
+        sticker.fontSize = ParseFontSize(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"size", 1, iniPath.c_str())));
+        sticker.locked = GetPrivateProfileIntW(section.c_str(), L"locked", 0, iniPath.c_str()) != 0;
+
+        wchar_t textBuf[8192] = {};
+        GetPrivateProfileStringW(section.c_str(), L"text", sticker.text.c_str(), textBuf,
+                                 static_cast<DWORD>(std::size(textBuf)), iniPath.c_str());
+        sticker.text = UnescapeIniValue(textBuf);
+        ClampToNearestMonitor(sticker);
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
+    }
+
+    if (g_app.stickers.empty()) {
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
+    }
+    return true;
+}
+
+void LoadState() {
+    g_app.jsonPath = GetJsonPath();
+
+    if (LoadStickersFromJson(g_app.jsonPath)) {
+        return;
+    }
+
+    // Migration: if the user is upgrading from an earlier version that wrote
+    // INI, pull data from there once and then save as JSON. We keep the .ini
+    // file on disk as a safety backup; subsequent saves only touch JSON.
+    g_app.iniPath = GetIniPath();
+    if (LoadStickersFromIni(g_app.iniPath)) {
+        // Persist immediately so the next launch reads JSON directly.
+        SaveAllState();
+        return;
+    }
+    // Fresh start.
+    g_app.stickers.clear();
+    g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
 }
 
 void UpdatePositionFromWindow(StickerState& sticker) {
@@ -303,34 +550,40 @@ void UpdatePositionFromWindow(StickerState& sticker) {
 }
 
 void SaveAllState() {
+    if (g_app.jsonPath.empty()) {
+        g_app.jsonPath = GetJsonPath();
+    }
     for (auto& sticker : g_app.stickers) {
-        UpdatePositionFromWindow(sticker);
+        UpdatePositionFromWindow(*sticker);
     }
 
-    const UINT oldCount = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
-    for (UINT i = 0; i < oldCount; ++i) {
-        const std::wstring section = StickerSectionName(static_cast<int>(i));
-        WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, g_app.iniPath.c_str());
+    json_min::Value root = json_min::Value::make_obj();
+    root["version"] = json_min::Value::make_int(kDataSchemaVersion);
+
+    json_min::Value arr = json_min::Value::make_arr();
+    for (const auto& up : g_app.stickers) {
+        const StickerState& s = *up;
+        json_min::Value obj = json_min::Value::make_obj();
+        obj["x"]      = json_min::Value::make_int(s.x);
+        obj["y"]      = json_min::Value::make_int(s.y);
+        obj["w"]      = json_min::Value::make_int(s.w);
+        obj["h"]      = json_min::Value::make_int(s.h);
+        obj["theme"]  = json_min::Value::make_int(ToThemeInt(s.theme));
+        obj["font"]   = json_min::Value::make_int(ToFontChoiceInt(s.fontChoice));
+        obj["size"]   = json_min::Value::make_int(ToFontSizeInt(s.fontSize));
+        obj["locked"] = json_min::Value::make_bool(s.locked);
+        obj["text"]   = json_min::Value::make_str(Utf16ToUtf8(s.text));
+        // Only persist colour overrides when set; absent keys mean "follow theme".
+        if (s.customBgColor   != kCustomColorUnset) obj["bgColor"]   = json_min::Value::make_int(s.customBgColor);
+        if (s.customTextColor != kCustomColorUnset) obj["textColor"] = json_min::Value::make_int(s.customTextColor);
+        if (s.opacityPercent  != kDefaultOpacityPercent) obj["opacity"] = json_min::Value::make_int(s.opacityPercent);
+        if (s.cornerRadius    != kDefaultCornerRadius)   obj["cornerRadius"] = json_min::Value::make_int(s.cornerRadius);
+        arr.a.push_back(std::move(obj));
     }
-    WritePrivateProfileStringW(kLegacySection, nullptr, nullptr, g_app.iniPath.c_str());
+    root["stickers"] = std::move(arr);
 
-    WritePrivateProfileStringW(kGeneralSection, L"StickerCount", std::to_wstring(g_app.stickers.size()).c_str(), g_app.iniPath.c_str());
-
-    for (size_t i = 0; i < g_app.stickers.size(); ++i) {
-        const StickerState& sticker = g_app.stickers[i];
-        const std::wstring section = StickerSectionName(static_cast<int>(i));
-
-        WritePrivateProfileStringW(section.c_str(), L"x", std::to_wstring(sticker.x).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"y", std::to_wstring(sticker.y).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"w", std::to_wstring(sticker.w).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"h", std::to_wstring(sticker.h).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"theme", std::to_wstring(ToThemeInt(sticker.theme)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"font", std::to_wstring(ToFontChoiceInt(sticker.fontChoice)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"size", std::to_wstring(ToFontSizeInt(sticker.fontSize)).c_str(), g_app.iniPath.c_str());
-        WritePrivateProfileStringW(section.c_str(), L"locked", sticker.locked ? L"1" : L"0", g_app.iniPath.c_str());
-        const std::wstring escaped = EscapeIniValue(sticker.text);
-        WritePrivateProfileStringW(section.c_str(), L"text", escaped.c_str(), g_app.iniPath.c_str());
-    }
+    const std::string text = json_min::write(root, /*pretty=*/true);
+    WriteEntireFileAtomic(g_app.jsonPath, text);
 }
 
 HWND FindWorkerW() {
@@ -363,8 +616,8 @@ HWND FindWorkerW() {
 
 StickerState* FindStickerByHwnd(HWND hwnd) {
     for (auto& sticker : g_app.stickers) {
-        if (sticker.hwnd == hwnd) {
-            return &sticker;
+        if (sticker->hwnd == hwnd) {
+            return sticker.get();
         }
     }
     return nullptr;
@@ -372,25 +625,40 @@ StickerState* FindStickerByHwnd(HWND hwnd) {
 
 StickerState* FindStickerByEdit(HWND edit) {
     for (auto& sticker : g_app.stickers) {
-        if (sticker.edit == edit) {
-            return &sticker;
+        if (sticker->edit == edit) {
+            return sticker.get();
         }
     }
     return nullptr;
 }
 
-HFONT CreateStickerFont(const StickerState& sticker, HWND hwnd) {
+int DetectDpi(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr && hwnd != nullptr) {
+        using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+        auto fn = reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(user32, "GetDpiForWindow"));
+        if (fn != nullptr) {
+            const UINT dpi = fn(hwnd);
+            if (dpi != 0) {
+                return static_cast<int>(dpi);
+            }
+        }
+    }
     HDC hdc = GetDC(hwnd);
     bool releaseScreenDc = false;
     if (hdc == nullptr) {
         hdc = GetDC(nullptr);
         releaseScreenDc = true;
     }
-    const int dpi = hdc != nullptr ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+    int dpi = 96;
     if (hdc != nullptr) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
         ReleaseDC(releaseScreenDc ? nullptr : hwnd, hdc);
     }
+    return dpi > 0 ? dpi : 96;
+}
 
+HFONT CreateStickerFont(const StickerState& sticker, int dpi) {
     LOGFONTW lf {};
     lf.lfHeight = -MulDiv(FontSizeToPoint(sticker.fontSize), dpi, 72);
     lf.lfQuality = CLEARTYPE_QUALITY;
@@ -402,56 +670,229 @@ HFONT CreateStickerFont(const StickerState& sticker, HWND hwnd) {
     return CreateFontIndirectW(&lf);
 }
 
-void ApplyStickerFont(StickerState& sticker) {
+void ApplyStickerFont(StickerState& sticker, int dpi = 0) {
+    if (dpi <= 0) {
+        dpi = DetectDpi(sticker.hwnd);
+    }
     if (sticker.font != nullptr) {
         DeleteObject(sticker.font);
         sticker.font = nullptr;
     }
-    sticker.font = CreateStickerFont(sticker, sticker.hwnd);
+    sticker.font = CreateStickerFont(sticker, dpi);
     if (sticker.edit != nullptr && sticker.font != nullptr) {
         SendMessageW(sticker.edit, WM_SETFONT, reinterpret_cast<WPARAM>(sticker.font), TRUE);
     }
 }
 
-COLORREF GetBackgroundColor(Theme theme) {
+struct ThemePreset {
+    COLORREF bg;
+    COLORREF fg;
+    int      opacityPercent;
+};
+
+ThemePreset GetThemePreset(Theme theme) {
     switch (theme) {
     case Theme::Miku:
-        return RGB(57, 197, 187);
+        return { RGB(57, 197, 187), RGB(20, 20, 20), 100 };
     case Theme::Transparent:
-        return kTransparentKeyColor;
+        // True per-pixel alpha is out of scope (see the d2d branch PR notes).
+        // We approximate the old chroma-key transparent theme with a dark
+        // semi-transparent slab plus a light foreground.
+        return { RGB(40, 40, 40), RGB(245, 245, 245), 65 };
     default:
-        return RGB(255, 248, 176);
+        return { RGB(255, 248, 176), RGB(20, 20, 20), 100 };
     }
 }
 
-COLORREF GetTextColor(Theme theme) {
-    if (theme == Theme::Transparent) {
-        return RGB(245, 245, 245);
+// ---- Theme packs (design tokens loaded from themes/*.json) ----------------
+
+struct ThemePack {
+    std::wstring id;
+    std::wstring name;
+    std::wstring description;
+    COLORREF     bgColor        = RGB(255, 248, 176);
+    COLORREF     textColor      = RGB(20, 20, 20);
+    int          opacityPercent = 100;
+    int          cornerRadius   = 12;
+};
+
+std::vector<ThemePack> g_themePacks;
+
+bool ParseHexColor(const std::string& s, COLORREF& out) {
+    if (s.size() != 7 || s[0] != '#') return false;
+    unsigned v = 0;
+    for (size_t i = 1; i < 7; ++i) {
+        const char c = s[i];
+        v <<= 4;
+        if      (c >= '0' && c <= '9') v |= static_cast<unsigned>(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= static_cast<unsigned>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= static_cast<unsigned>(c - 'A' + 10);
+        else return false;
     }
-    return RGB(20, 20, 20);
+    out = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    return true;
+}
+
+bool LoadThemePackFromFile(const std::wstring& path, ThemePack& out) {
+    std::string buf;
+    if (!ReadEntireFile(path, buf)) return false;
+    json_min::Value root;
+    if (!json_min::parse(buf, root) || root.type != json_min::Value::Type::Obj) return false;
+
+    if (auto* p = root.find("schemaVersion"); p == nullptr || p->as_int(0) != 1) {
+        return false;
+    }
+    auto* idP = root.find("id");
+    auto* nameP = root.find("name");
+    if (idP == nullptr || idP->type != json_min::Value::Type::Str || idP->s.empty()) return false;
+    if (nameP == nullptr || nameP->type != json_min::Value::Type::Str || nameP->s.empty()) return false;
+
+    out = ThemePack{};
+    out.id   = Utf8ToUtf16(idP->s);
+    out.name = Utf8ToUtf16(nameP->s);
+    if (auto* p = root.find("description"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        out.description = Utf8ToUtf16(p->s);
+    }
+
+    const json_min::Value* tokens = root.find("tokens");
+    if (tokens == nullptr || tokens->type != json_min::Value::Type::Obj) return false;
+
+    if (auto* p = tokens->find("bgColor"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        if (!ParseHexColor(p->s, out.bgColor)) return false;
+    }
+    if (auto* p = tokens->find("textColor"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        if (!ParseHexColor(p->s, out.textColor)) return false;
+    }
+    if (auto* p = tokens->find("opacityPercent"); p != nullptr) {
+        out.opacityPercent = std::clamp(static_cast<int>(p->as_int(100)),
+                                        kMinOpacityPercent, 100);
+    }
+    if (auto* p = tokens->find("cornerRadius"); p != nullptr) {
+        out.cornerRadius = std::clamp(static_cast<int>(p->as_int(12)),
+                                      0, kMaxCornerRadius);
+    }
+    return true;
+}
+
+void LoadThemePacksFromDirectory(const std::wstring& dir) {
+    if (dir.empty()) return;
+    const std::wstring pattern = dir + L"\\*.json";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring full = dir + L"\\" + fd.cFileName;
+        ThemePack pack;
+        if (!LoadThemePackFromFile(full, pack)) continue;
+        // Deduplicate: replace any existing pack with the same id (later
+        // directories win, matching the docs).
+        auto it = std::find_if(g_themePacks.begin(), g_themePacks.end(),
+                               [&](const ThemePack& tp) { return tp.id == pack.id; });
+        if (it != g_themePacks.end()) {
+            *it = std::move(pack);
+        } else {
+            g_themePacks.push_back(std::move(pack));
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+void LoadAllThemePacks() {
+    g_themePacks.clear();
+    // 1) Portable / EXE-adjacent.
+    LoadThemePacksFromDirectory(GetModuleDirectory() + L"\\themes");
+    // 2) Per-user override.
+    PWSTR localAppData = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData))) {
+        std::wstring dir(localAppData);
+        CoTaskMemFree(localAppData);
+        dir += L"\\LightSticker\\themes";
+        LoadThemePacksFromDirectory(dir);
+    }
+    // Stable menu order regardless of FS enumeration order.
+    std::sort(g_themePacks.begin(), g_themePacks.end(),
+              [](const ThemePack& a, const ThemePack& b) { return a.name < b.name; });
+}
+
+void ApplyThemePack(StickerState& sticker, const ThemePack& pack) {
+    sticker.customBgColor   = static_cast<int>(pack.bgColor);
+    sticker.customTextColor = static_cast<int>(pack.textColor);
+    sticker.opacityPercent  = std::clamp(pack.opacityPercent, kMinOpacityPercent, 100);
+    sticker.cornerRadius    = std::clamp(pack.cornerRadius, 0, kMaxCornerRadius);
+}
+
+COLORREF ResolveBgColor(const StickerState& s) {
+    if (s.customBgColor != kCustomColorUnset) {
+        return static_cast<COLORREF>(s.customBgColor);
+    }
+    return GetThemePreset(s.theme).bg;
+}
+
+COLORREF ResolveTextColor(const StickerState& s) {
+    if (s.customTextColor != kCustomColorUnset) {
+        return static_cast<COLORREF>(s.customTextColor);
+    }
+    return GetThemePreset(s.theme).fg;
+}
+
+const wchar_t* ResolveFontFace(const StickerState& s) {
+    return s.fontChoice == FontChoice::Consolas ? L"Consolas" : L"Segoe UI";
+}
+
+StickerVisual VisualFromSticker(const StickerState& s) {
+    StickerVisual v;
+    v.fontFace      = ResolveFontFace(s);
+    v.ptSize        = static_cast<float>(FontSizeToPoint(s.fontSize));
+    v.bgColor       = ResolveBgColor(s);
+    v.textColor     = ResolveTextColor(s);
+    v.cornerRadius  = static_cast<float>(s.cornerRadius);
+    v.paddingDip    = 12;
+    return v;
+}
+
+void ApplyOpacity(StickerState& sticker) {
+    if (sticker.hwnd == nullptr) return;
+    const int pct = std::clamp(sticker.opacityPercent, kMinOpacityPercent, 100);
+    const BYTE alpha = static_cast<BYTE>((pct * 255) / 100);
+    SetLayeredWindowAttributes(sticker.hwnd, 0, alpha, LWA_ALPHA);
+}
+
+void UpdateStickerWindowRgn(StickerState& sticker) {
+    if (sticker.hwnd == nullptr) return;
+    RECT rc{};
+    GetClientRect(sticker.hwnd, &rc);
+    if (sticker.cornerRadius <= 0) {
+        SetWindowRgn(sticker.hwnd, nullptr, TRUE);
+        return;
+    }
+    const int dpi = DetectDpi(sticker.hwnd);
+    const int radiusPx = MulDiv(sticker.cornerRadius * 2, dpi, 96);
+    HRGN rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, radiusPx, radiusPx);
+    // SetWindowRgn takes ownership; do not DeleteObject(rgn).
+    SetWindowRgn(sticker.hwnd, rgn, TRUE);
+}
+
+void RequestRepaint(StickerState& sticker) {
+    if (sticker.hwnd != nullptr) {
+        InvalidateRect(sticker.hwnd, nullptr, FALSE);
+    }
 }
 
 void ApplyThemeWindowStyle(StickerState& sticker) {
     if (sticker.hwnd == nullptr) {
         return;
     }
-
+    // We always keep WS_EX_LAYERED on so per-sticker opacity works without
+    // destroying & recreating the window.
     LONG_PTR exStyle = GetWindowLongPtrW(sticker.hwnd, GWL_EXSTYLE);
-    const bool transparent = sticker.theme == Theme::Transparent;
-    if (transparent) {
-        exStyle |= WS_EX_LAYERED;
-    } else {
-        exStyle &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
-    }
-
+    exStyle |= WS_EX_LAYERED;
     SetWindowLongPtrW(sticker.hwnd, GWL_EXSTYLE, exStyle);
-    if (transparent) {
-        SetLayeredWindowAttributes(sticker.hwnd, kTransparentKeyColor, 0, LWA_COLORKEY);
-    }
-
+    ApplyOpacity(sticker);
     SetWindowPos(sticker.hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    InvalidateRect(sticker.hwnd, nullptr, TRUE);
+    UpdateStickerWindowRgn(sticker);
+    RequestRepaint(sticker);
 }
 
 LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -560,17 +1001,50 @@ void AdjustSizeChoice(StickerState& sticker, int delta) {
 
 bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance);
 
+void ReattachStickerToWorkerW(StickerState& sticker) {
+    if (sticker.hwnd != nullptr && g_app.workerw != nullptr) {
+        SetParent(sticker.hwnd, g_app.workerw);
+    }
+}
+
+void RefreshAndReattachAll() {
+    g_app.workerw = FindWorkerW();
+    for (auto& sticker : g_app.stickers) {
+        ReattachStickerToWorkerW(*sticker);
+        if (sticker->hwnd != nullptr) {
+            // After Explorer restart the sticker may have been hidden.
+            ShowWindow(sticker->hwnd, SW_SHOW);
+            InvalidateRect(sticker->hwnd, nullptr, TRUE);
+        }
+    }
+}
+
+LRESULT CALLBACK ShellHookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_app.taskbarCreatedMsg != 0 && msg == g_app.taskbarCreatedMsg) {
+        RefreshAndReattachAll();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 void RemoveStickerByHwnd(HWND hwnd) {
     auto it = std::find_if(g_app.stickers.begin(), g_app.stickers.end(),
-                           [hwnd](const StickerState& s) { return s.hwnd == hwnd; });
+                           [hwnd](const std::unique_ptr<StickerState>& s) {
+                               return s != nullptr && s->hwnd == hwnd;
+                           });
     if (it == g_app.stickers.end()) {
         return;
     }
 
-    if (it->font != nullptr) {
-        DeleteObject(it->font);
-        it->font = nullptr;
+    if ((*it)->font != nullptr) {
+        DeleteObject((*it)->font);
+        (*it)->font = nullptr;
     }
+    if ((*it)->editBgBrush != nullptr) {
+        DeleteObject((*it)->editBgBrush);
+        (*it)->editBgBrush = nullptr;
+    }
+    D2DDestroyRenderer((*it)->renderer);
     g_app.stickers.erase(it);
 }
 
@@ -600,15 +1074,15 @@ void BeginExitAll() {
     g_app.exiting = true;
 
     for (auto& sticker : g_app.stickers) {
-        EndEdit(sticker, true);
+        EndEdit(*sticker, true);
     }
     SaveAllState();
 
     std::vector<HWND> windows;
     windows.reserve(g_app.stickers.size());
     for (const auto& sticker : g_app.stickers) {
-        if (sticker.hwnd != nullptr) {
-            windows.push_back(sticker.hwnd);
+        if (sticker->hwnd != nullptr) {
+            windows.push_back(sticker->hwnd);
         }
     }
 
@@ -630,13 +1104,17 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         }
         break;
     case kMenuNewId: {
-        StickerState created = MakeDefaultSticker();
-        created.x = sticker->x + 30;
-        created.y = sticker->y + 30;
-        g_app.stickers.push_back(std::move(created));
-        StickerState& newest = g_app.stickers.back();
+        auto created = std::make_unique<StickerState>(MakeDefaultSticker());
+        created->x = sticker->x + 30;
+        created->y = sticker->y + 30;
+        ClampToNearestMonitor(*created);
+        // Snapshot pointer + instance BEFORE push_back, so subsequent
+        // window-creation calls do not depend on `sticker` (which may dangle
+        // if the vector reallocates).
+        StickerState* newPtr = created.get();
         HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-        if (!CreateStickerWindow(newest, instance)) {
+        g_app.stickers.push_back(std::move(created));
+        if (!CreateStickerWindow(*newPtr, instance)) {
             g_app.stickers.pop_back();
             return;
         }
@@ -644,17 +1122,22 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         break;
     }
     case kMenuDuplicateId: {
-        StickerState duplicated = *sticker;
-        duplicated.hwnd = nullptr;
-        duplicated.edit = nullptr;
-        duplicated.editOrigProc = nullptr;
-        duplicated.font = nullptr;
-        duplicated.x += 30;
-        duplicated.y += 30;
-        g_app.stickers.push_back(std::move(duplicated));
-        StickerState& newest = g_app.stickers.back();
+        auto duplicated = std::make_unique<StickerState>(*sticker);
+        duplicated->hwnd = nullptr;
+        duplicated->edit = nullptr;
+        duplicated->editOrigProc = nullptr;
+        duplicated->font = nullptr;
+        duplicated->editBgBrush = nullptr;
+        // The renderer holds COM pointers that must not be aliased into the
+        // copy; the new sticker will create its own on first paint.
+        duplicated->renderer = StickerRenderer{};
+        duplicated->x += 30;
+        duplicated->y += 30;
+        ClampToNearestMonitor(*duplicated);
+        StickerState* newPtr = duplicated.get();
         HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-        if (!CreateStickerWindow(newest, instance)) {
+        g_app.stickers.push_back(std::move(duplicated));
+        if (!CreateStickerWindow(*newPtr, instance)) {
             g_app.stickers.pop_back();
             return;
         }
@@ -673,16 +1156,25 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         break;
     case kMenuThemeDefaultId:
         sticker->theme = Theme::Default;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Default).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
     case kMenuThemeMikuId:
         sticker->theme = Theme::Miku;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Miku).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
     case kMenuThemeTransparentId:
         sticker->theme = Theme::Transparent;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Transparent).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
@@ -720,6 +1212,14 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         BeginExitAll();
         break;
     default:
+        if (cmd >= kMenuThemePackBaseId && cmd <= kMenuThemePackMaxId) {
+            const size_t idx = cmd - kMenuThemePackBaseId;
+            if (idx < g_themePacks.size()) {
+                ApplyThemePack(*sticker, g_themePacks[idx]);
+                ApplyThemeWindowStyle(*sticker);
+                SaveAllState();
+            }
+        }
         break;
     }
 }
@@ -742,6 +1242,22 @@ void ShowContextMenu(HWND hwnd, const StickerState& sticker, POINT pt) {
     AppendMenuW(themeMenu, MF_STRING | (sticker.theme == Theme::Miku ? MF_CHECKED : 0), kMenuThemeMikuId, L"Miku");
     AppendMenuW(themeMenu, MF_STRING | (sticker.theme == Theme::Transparent ? MF_CHECKED : 0), kMenuThemeTransparentId,
                 L"Transparent");
+
+    if (!g_themePacks.empty()) {
+        AppendMenuW(themeMenu, MF_SEPARATOR, 0, nullptr);
+        // Active-pack detection: a pack is "active" when both colours match
+        // exactly. The user could of course tweak custom colours by hand
+        // (future feature) and lose the checkmark, which is fine.
+        for (size_t i = 0; i < g_themePacks.size(); ++i) {
+            const ThemePack& pack = g_themePacks[i];
+            const bool active =
+                sticker.customBgColor   == static_cast<int>(pack.bgColor)   &&
+                sticker.customTextColor == static_cast<int>(pack.textColor);
+            const UINT id = kMenuThemePackBaseId + static_cast<UINT>(i);
+            if (id > kMenuThemePackMaxId) break;
+            AppendMenuW(themeMenu, MF_STRING | (active ? MF_CHECKED : 0), id, pack.name.c_str());
+        }
+    }
 
     AppendMenuW(fontMenu, MF_STRING | (sticker.fontChoice == FontChoice::Default ? MF_CHECKED : 0), kMenuFontDefaultId, L"Default");
     AppendMenuW(fontMenu, MF_STRING | (sticker.fontChoice == FontChoice::Consolas ? MF_CHECKED : 0), kMenuFontConsolasId,
@@ -775,6 +1291,15 @@ void ShowContextMenu(HWND hwnd, const StickerState& sticker, POINT pt) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     StickerState* sticker = FindStickerByHwnd(hwnd);
 
+    if (g_app.taskbarCreatedMsg != 0 && msg == g_app.taskbarCreatedMsg) {
+        // Explorer was restarted -- the WorkerW handle we stored is stale.
+        // Re-find WorkerW once and re-parent every sticker.
+        // Multiple stickers receive this broadcast, but successive calls are
+        // idempotent (SetParent with the same parent is a no-op).
+        RefreshAndReattachAll();
+        return 0;
+    }
+
     switch (msg) {
     case WM_NCHITTEST: {
         if (sticker == nullptr) {
@@ -793,14 +1318,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 140;
-        mmi->ptMinTrackSize.y = 80;
+        const int dpi = DetectDpi(hwnd);
+        mmi->ptMinTrackSize.x = MulDiv(140, dpi, 96);
+        mmi->ptMinTrackSize.y = MulDiv(80, dpi, 96);
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        if (sticker != nullptr) {
+            const int newDpi = static_cast<int>(HIWORD(wParam));
+            ApplyStickerFont(*sticker, newDpi);
+            const RECT* sug = reinterpret_cast<const RECT*>(lParam);
+            if (sug != nullptr) {
+                SetWindowPos(hwnd, nullptr, sug->left, sug->top,
+                             sug->right - sug->left, sug->bottom - sug->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            // The new size & DPI need to be propagated to D2D as well.
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            D2DResize(sticker->renderer, client.right - client.left,
+                      client.bottom - client.top, newDpi);
+            UpdateStickerWindowRgn(*sticker);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
         return 0;
     }
     case WM_MOVE:
     case WM_SIZE:
         if (sticker != nullptr) {
             UpdatePositionFromWindow(*sticker);
+            if (msg == WM_SIZE) {
+                D2DResize(sticker->renderer, LOWORD(lParam), HIWORD(lParam),
+                          DetectDpi(hwnd));
+                UpdateStickerWindowRgn(*sticker);
+            }
             if (sticker->edit != nullptr) {
                 RECT client {};
                 GetClientRect(hwnd, &client);
@@ -842,19 +1393,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveAllState();
         }
         return 0;
+    case WM_ERASEBKGND:
+        // We paint the entire client via Direct2D in WM_PAINT; tell the OS
+        // not to fill it first (otherwise we get a flash of the class brush).
+        return 1;
+    case WM_CTLCOLOREDIT:
+        if (sticker != nullptr && reinterpret_cast<HWND>(lParam) == sticker->edit) {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            const COLORREF bg = ResolveBgColor(*sticker);
+            const COLORREF fg = ResolveTextColor(*sticker);
+            SetTextColor(hdc, fg);
+            SetBkColor(hdc, bg);
+            if (sticker->editBgBrush != nullptr) {
+                DeleteObject(sticker->editBgBrush);
+            }
+            sticker->editBgBrush = CreateSolidBrush(bg);
+            return reinterpret_cast<LRESULT>(sticker->editBgBrush);
+        }
+        break;
     case WM_PAINT:
         if (sticker != nullptr) {
+            // Lazy renderer creation; succeeds in the common case but falls
+            // back to GDI rendering below if Direct2D init failed or the
+            // device was lost.
+            if (sticker->renderer.rt == nullptr) {
+                D2DCreateRenderer(sticker->renderer, hwnd, DetectDpi(hwnd));
+            }
+            if (sticker->renderer.rt != nullptr) {
+                // Validate the dirty region so the OS doesn't keep posting
+                // WM_PAINT; Direct2D doesn't use BeginPaint plumbing.
+                ValidateRect(hwnd, nullptr);
+                D2DPaint(sticker->renderer, sticker->text, VisualFromSticker(*sticker));
+                return 0;
+            }
+
+            // ---- GDI fallback (only when Direct2D could not be initialised) ----
             PAINTSTRUCT ps {};
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT client {};
             GetClientRect(hwnd, &client);
 
-            HBRUSH brush = CreateSolidBrush(GetBackgroundColor(sticker->theme));
+            HBRUSH brush = CreateSolidBrush(ResolveBgColor(*sticker));
             FillRect(hdc, &client, brush);
             DeleteObject(brush);
 
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, GetTextColor(sticker->theme));
+            SetTextColor(hdc, ResolveTextColor(*sticker));
             if (sticker->font == nullptr) {
                 ApplyStickerFont(*sticker);
             }
@@ -883,7 +1467,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
-    const DWORD exStyle = WS_EX_TOOLWINDOW | (sticker.theme == Theme::Transparent ? WS_EX_LAYERED : 0);
+    const DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
     HWND hwnd = CreateWindowExW(
         exStyle, kWindowClassName, L"LightSticker",
         WS_VISIBLE | WS_POPUP,
@@ -899,7 +1483,9 @@ bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
     }
 
     ApplyStickerFont(sticker);
-    ApplyThemeWindowStyle(sticker);
+    D2DCreateRenderer(sticker.renderer, hwnd, DetectDpi(hwnd));
+    ApplyOpacity(sticker);
+    UpdateStickerWindowRgn(sticker);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     return true;
@@ -908,7 +1494,26 @@ bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    // Best-effort: declare PerMonitor V2 DPI awareness at runtime as well.
+    // The embedded manifest is the canonical declaration; this is a fallback
+    // for environments where the manifest was stripped or is not honored.
+    {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32 != nullptr) {
+            using SetCtxFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+            auto setCtx = reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+            if (setCtx != nullptr) {
+                setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
+        }
+    }
+
+    // Direct2D + DirectWrite. If init fails we still run, falling back to the
+    // GDI WM_PAINT branch.
+    D2DInit();
+
     LoadState();
+    LoadAllThemePacks();
 
     WNDCLASSEXW wc {};
     wc.cbSize = sizeof(wc);
@@ -916,25 +1521,57 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    // Direct2D paints the entire client; the OS background brush would just
+    // flash through during resize.
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClassName;
     if (RegisterClassExW(&wc) == 0) {
         return 1;
+    }
+
+    // Listen for the broadcast Explorer sends after a restart so we can
+    // re-attach our stickers to the new WorkerW handle.
+    g_app.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+
+    // Sticker windows become children of WorkerW and stop receiving broadcasts,
+    // so we register a hidden top-level window solely to listen for
+    // "TaskbarCreated" (i.e. Explorer restart).
+    WNDCLASSEXW hookWc {};
+    hookWc.cbSize = sizeof(hookWc);
+    hookWc.lpfnWndProc = ShellHookWndProc;
+    hookWc.hInstance = instance;
+    hookWc.lpszClassName = kHookWindowClassName;
+    RegisterClassExW(&hookWc);
+    HWND hookWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW, kHookWindowClassName, L"", WS_OVERLAPPED,
+        0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    if (hookWindow != nullptr && g_app.taskbarCreatedMsg != 0) {
+        // Required so we receive the broadcast even when running elevated
+        // alongside a non-elevated Explorer (UIPI).
+        using ChangeWindowMessageFilterExFn = BOOL(WINAPI*)(HWND, UINT, DWORD, void*);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        if (u != nullptr) {
+            auto fn = reinterpret_cast<ChangeWindowMessageFilterExFn>(
+                GetProcAddress(u, "ChangeWindowMessageFilterEx"));
+            if (fn != nullptr) {
+                fn(hookWindow, g_app.taskbarCreatedMsg, /*MSGFLT_ALLOW*/ 1, nullptr);
+            }
+        }
     }
 
     g_app.workerw = FindWorkerW();
 
     bool createdAny = false;
     for (auto& sticker : g_app.stickers) {
-        if (CreateStickerWindow(sticker, instance)) {
+        if (CreateStickerWindow(*sticker, instance)) {
             createdAny = true;
         }
     }
 
     if (!createdAny) {
         g_app.stickers.clear();
-        g_app.stickers.push_back(MakeDefaultSticker());
-        if (!CreateStickerWindow(g_app.stickers.front(), instance)) {
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
+        if (!CreateStickerWindow(*g_app.stickers.front(), instance)) {
             return 1;
         }
     }
@@ -944,5 +1581,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    D2DShutdown();
     return static_cast<int>(msg.wParam);
 }

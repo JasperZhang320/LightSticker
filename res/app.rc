@@ -1,0 +1,36 @@
+#include <windows.h>
+
+// Embed the application manifest so the OS picks up:
+//   - PerMonitor V2 DPI awareness
+//   - Windows 10/11 supportedOS GUIDs
+//   - Common Controls v6
+1 RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    0,2,0,0
+PRODUCTVERSION 0,2,0,0
+FILEFLAGSMASK  0x3FL
+FILEFLAGS      0x0L
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "LightSticker"
+            VALUE "FileDescription",  "LightSticker - lightweight desktop sticky notes"
+            VALUE "FileVersion",      "0.2.0.0"
+            VALUE "InternalName",     "LightSticker"
+            VALUE "LegalCopyright",   "Released under the MIT License"
+            VALUE "OriginalFilename", "LightSticker.exe"
+            VALUE "ProductName",      "LightSticker"
+            VALUE "ProductVersion",   "0.2.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
