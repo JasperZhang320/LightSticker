@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "d2d_renderer.h"
 #include "json_min.h"
 
 namespace {
@@ -19,7 +20,6 @@ constexpr wchar_t kGeneralSection[] = L"General";
 constexpr wchar_t kLegacySection[] = L"Sticker";
 constexpr UINT kMsgEndEdit = WM_APP + 1;
 constexpr int kResizeBorder = 8;
-constexpr COLORREF kTransparentKeyColor = RGB(1, 2, 3);
 constexpr UINT kMaxStickerCount = 1024;
 
 constexpr UINT kMenuEditId = 1001;
@@ -59,11 +59,20 @@ enum class FontSize : int {
 
 constexpr int kMaxFontSizeIndex = static_cast<int>(FontSize::Large);
 
+constexpr int kDefaultOpacityPercent = 100;
+constexpr int kMinOpacityPercent     = 20;
+constexpr int kDefaultCornerRadius   = 12;
+constexpr int kMaxCornerRadius       = 48;
+constexpr int kCustomColorUnset      = -1;
+
 struct StickerState {
     HWND hwnd = nullptr;
     HWND edit = nullptr;
     WNDPROC editOrigProc = nullptr;
     HFONT font = nullptr;
+    HBRUSH editBgBrush = nullptr;
+
+    StickerRenderer renderer;
 
     std::wstring text = L"Double-click to edit";
     int x = 120;
@@ -75,6 +84,13 @@ struct StickerState {
     FontChoice fontChoice = FontChoice::Default;
     FontSize fontSize = FontSize::Medium;
     bool locked = false;
+
+    // -1 means "follow theme"; otherwise a 0x00RRGGBB COLORREF.
+    int customBgColor   = kCustomColorUnset;
+    int customTextColor = kCustomColorUnset;
+
+    int opacityPercent = kDefaultOpacityPercent;   // 20..100
+    int cornerRadius   = kDefaultCornerRadius;     // 0..48 in DIPs
 };
 
 struct AppState {
@@ -405,6 +421,25 @@ bool LoadStickersFromJson(const std::wstring& path) {
         if (auto* p = el.find("size"))   sticker.fontSize = ParseFontSize(static_cast<int>(p->as_int(1)));
         if (auto* p = el.find("locked")) sticker.locked = p->as_bool(false);
         if (auto* p = el.find("text"))   sticker.text = Utf8ToUtf16(p->as_str());
+        // New visual fields (optional; legacy files just inherit theme defaults).
+        if (auto* p = el.find("bgColor")) {
+            const long long v = p->as_int(kCustomColorUnset);
+            sticker.customBgColor = (v >= 0 && v <= 0xFFFFFF) ? static_cast<int>(v) : kCustomColorUnset;
+        }
+        if (auto* p = el.find("textColor")) {
+            const long long v = p->as_int(kCustomColorUnset);
+            sticker.customTextColor = (v >= 0 && v <= 0xFFFFFF) ? static_cast<int>(v) : kCustomColorUnset;
+        }
+        if (auto* p = el.find("opacity")) {
+            sticker.opacityPercent = std::clamp(static_cast<int>(p->as_int(kDefaultOpacityPercent)),
+                                                kMinOpacityPercent, 100);
+        } else {
+            sticker.opacityPercent = GetThemePreset(sticker.theme).opacityPercent;
+        }
+        if (auto* p = el.find("cornerRadius")) {
+            sticker.cornerRadius = std::clamp(static_cast<int>(p->as_int(kDefaultCornerRadius)),
+                                              0, kMaxCornerRadius);
+        }
         ClampToNearestMonitor(sticker);
         if (g_app.stickers.size() >= kMaxStickerCount) break;
         g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
@@ -533,6 +568,11 @@ void SaveAllState() {
         obj["size"]   = json_min::Value::make_int(ToFontSizeInt(s.fontSize));
         obj["locked"] = json_min::Value::make_bool(s.locked);
         obj["text"]   = json_min::Value::make_str(Utf16ToUtf8(s.text));
+        // Only persist colour overrides when set; absent keys mean "follow theme".
+        if (s.customBgColor   != kCustomColorUnset) obj["bgColor"]   = json_min::Value::make_int(s.customBgColor);
+        if (s.customTextColor != kCustomColorUnset) obj["textColor"] = json_min::Value::make_int(s.customTextColor);
+        if (s.opacityPercent  != kDefaultOpacityPercent) obj["opacity"] = json_min::Value::make_int(s.opacityPercent);
+        if (s.cornerRadius    != kDefaultCornerRadius)   obj["cornerRadius"] = json_min::Value::make_int(s.cornerRadius);
         arr.a.push_back(std::move(obj));
     }
     root["stickers"] = std::move(arr);
@@ -639,45 +679,97 @@ void ApplyStickerFont(StickerState& sticker, int dpi = 0) {
     }
 }
 
-COLORREF GetBackgroundColor(Theme theme) {
+struct ThemePreset {
+    COLORREF bg;
+    COLORREF fg;
+    int      opacityPercent;
+};
+
+ThemePreset GetThemePreset(Theme theme) {
     switch (theme) {
     case Theme::Miku:
-        return RGB(57, 197, 187);
+        return { RGB(57, 197, 187), RGB(20, 20, 20), 100 };
     case Theme::Transparent:
-        return kTransparentKeyColor;
+        // True per-pixel alpha is out of scope (see the d2d branch PR notes).
+        // We approximate the old chroma-key transparent theme with a dark
+        // semi-transparent slab plus a light foreground.
+        return { RGB(40, 40, 40), RGB(245, 245, 245), 65 };
     default:
-        return RGB(255, 248, 176);
+        return { RGB(255, 248, 176), RGB(20, 20, 20), 100 };
     }
 }
 
-COLORREF GetTextColor(Theme theme) {
-    if (theme == Theme::Transparent) {
-        return RGB(245, 245, 245);
+COLORREF ResolveBgColor(const StickerState& s) {
+    if (s.customBgColor != kCustomColorUnset) {
+        return static_cast<COLORREF>(s.customBgColor);
     }
-    return RGB(20, 20, 20);
+    return GetThemePreset(s.theme).bg;
+}
+
+COLORREF ResolveTextColor(const StickerState& s) {
+    if (s.customTextColor != kCustomColorUnset) {
+        return static_cast<COLORREF>(s.customTextColor);
+    }
+    return GetThemePreset(s.theme).fg;
+}
+
+const wchar_t* ResolveFontFace(const StickerState& s) {
+    return s.fontChoice == FontChoice::Consolas ? L"Consolas" : L"Segoe UI";
+}
+
+StickerVisual VisualFromSticker(const StickerState& s) {
+    StickerVisual v;
+    v.fontFace      = ResolveFontFace(s);
+    v.ptSize        = static_cast<float>(FontSizeToPoint(s.fontSize));
+    v.bgColor       = ResolveBgColor(s);
+    v.textColor     = ResolveTextColor(s);
+    v.cornerRadius  = static_cast<float>(s.cornerRadius);
+    v.paddingDip    = 12;
+    return v;
+}
+
+void ApplyOpacity(StickerState& sticker) {
+    if (sticker.hwnd == nullptr) return;
+    const int pct = std::clamp(sticker.opacityPercent, kMinOpacityPercent, 100);
+    const BYTE alpha = static_cast<BYTE>((pct * 255) / 100);
+    SetLayeredWindowAttributes(sticker.hwnd, 0, alpha, LWA_ALPHA);
+}
+
+void UpdateStickerWindowRgn(StickerState& sticker) {
+    if (sticker.hwnd == nullptr) return;
+    RECT rc{};
+    GetClientRect(sticker.hwnd, &rc);
+    if (sticker.cornerRadius <= 0) {
+        SetWindowRgn(sticker.hwnd, nullptr, TRUE);
+        return;
+    }
+    const int dpi = DetectDpi(sticker.hwnd);
+    const int radiusPx = MulDiv(sticker.cornerRadius * 2, dpi, 96);
+    HRGN rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, radiusPx, radiusPx);
+    // SetWindowRgn takes ownership; do not DeleteObject(rgn).
+    SetWindowRgn(sticker.hwnd, rgn, TRUE);
+}
+
+void RequestRepaint(StickerState& sticker) {
+    if (sticker.hwnd != nullptr) {
+        InvalidateRect(sticker.hwnd, nullptr, FALSE);
+    }
 }
 
 void ApplyThemeWindowStyle(StickerState& sticker) {
     if (sticker.hwnd == nullptr) {
         return;
     }
-
+    // We always keep WS_EX_LAYERED on so per-sticker opacity works without
+    // destroying & recreating the window.
     LONG_PTR exStyle = GetWindowLongPtrW(sticker.hwnd, GWL_EXSTYLE);
-    const bool transparent = sticker.theme == Theme::Transparent;
-    if (transparent) {
-        exStyle |= WS_EX_LAYERED;
-    } else {
-        exStyle &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
-    }
-
+    exStyle |= WS_EX_LAYERED;
     SetWindowLongPtrW(sticker.hwnd, GWL_EXSTYLE, exStyle);
-    if (transparent) {
-        SetLayeredWindowAttributes(sticker.hwnd, kTransparentKeyColor, 0, LWA_COLORKEY);
-    }
-
+    ApplyOpacity(sticker);
     SetWindowPos(sticker.hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    InvalidateRect(sticker.hwnd, nullptr, TRUE);
+    UpdateStickerWindowRgn(sticker);
+    RequestRepaint(sticker);
 }
 
 LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -825,6 +917,11 @@ void RemoveStickerByHwnd(HWND hwnd) {
         DeleteObject((*it)->font);
         (*it)->font = nullptr;
     }
+    if ((*it)->editBgBrush != nullptr) {
+        DeleteObject((*it)->editBgBrush);
+        (*it)->editBgBrush = nullptr;
+    }
+    D2DDestroyRenderer((*it)->renderer);
     g_app.stickers.erase(it);
 }
 
@@ -907,6 +1004,10 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         duplicated->edit = nullptr;
         duplicated->editOrigProc = nullptr;
         duplicated->font = nullptr;
+        duplicated->editBgBrush = nullptr;
+        // The renderer holds COM pointers that must not be aliased into the
+        // copy; the new sticker will create its own on first paint.
+        duplicated->renderer = StickerRenderer{};
         duplicated->x += 30;
         duplicated->y += 30;
         ClampToNearestMonitor(*duplicated);
@@ -932,16 +1033,25 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         break;
     case kMenuThemeDefaultId:
         sticker->theme = Theme::Default;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Default).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
     case kMenuThemeMikuId:
         sticker->theme = Theme::Miku;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Miku).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
     case kMenuThemeTransparentId:
         sticker->theme = Theme::Transparent;
+        sticker->customBgColor   = kCustomColorUnset;
+        sticker->customTextColor = kCustomColorUnset;
+        sticker->opacityPercent  = GetThemePreset(Theme::Transparent).opacityPercent;
         ApplyThemeWindowStyle(*sticker);
         SaveAllState();
         break;
@@ -1076,6 +1186,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                              sug->right - sug->left, sug->bottom - sug->top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
             }
+            // The new size & DPI need to be propagated to D2D as well.
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            D2DResize(sticker->renderer, client.right - client.left,
+                      client.bottom - client.top, newDpi);
+            UpdateStickerWindowRgn(*sticker);
             InvalidateRect(hwnd, nullptr, TRUE);
         }
         return 0;
@@ -1084,6 +1200,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_SIZE:
         if (sticker != nullptr) {
             UpdatePositionFromWindow(*sticker);
+            if (msg == WM_SIZE) {
+                D2DResize(sticker->renderer, LOWORD(lParam), HIWORD(lParam),
+                          DetectDpi(hwnd));
+                UpdateStickerWindowRgn(*sticker);
+            }
             if (sticker->edit != nullptr) {
                 RECT client {};
                 GetClientRect(hwnd, &client);
@@ -1125,19 +1246,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveAllState();
         }
         return 0;
+    case WM_ERASEBKGND:
+        // We paint the entire client via Direct2D in WM_PAINT; tell the OS
+        // not to fill it first (otherwise we get a flash of the class brush).
+        return 1;
+    case WM_CTLCOLOREDIT:
+        if (sticker != nullptr && reinterpret_cast<HWND>(lParam) == sticker->edit) {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            const COLORREF bg = ResolveBgColor(*sticker);
+            const COLORREF fg = ResolveTextColor(*sticker);
+            SetTextColor(hdc, fg);
+            SetBkColor(hdc, bg);
+            if (sticker->editBgBrush != nullptr) {
+                DeleteObject(sticker->editBgBrush);
+            }
+            sticker->editBgBrush = CreateSolidBrush(bg);
+            return reinterpret_cast<LRESULT>(sticker->editBgBrush);
+        }
+        break;
     case WM_PAINT:
         if (sticker != nullptr) {
+            // Lazy renderer creation; succeeds in the common case but falls
+            // back to GDI rendering below if Direct2D init failed or the
+            // device was lost.
+            if (sticker->renderer.rt == nullptr) {
+                D2DCreateRenderer(sticker->renderer, hwnd, DetectDpi(hwnd));
+            }
+            if (sticker->renderer.rt != nullptr) {
+                // Validate the dirty region so the OS doesn't keep posting
+                // WM_PAINT; Direct2D doesn't use BeginPaint plumbing.
+                ValidateRect(hwnd, nullptr);
+                D2DPaint(sticker->renderer, sticker->text, VisualFromSticker(*sticker));
+                return 0;
+            }
+
+            // ---- GDI fallback (only when Direct2D could not be initialised) ----
             PAINTSTRUCT ps {};
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT client {};
             GetClientRect(hwnd, &client);
 
-            HBRUSH brush = CreateSolidBrush(GetBackgroundColor(sticker->theme));
+            HBRUSH brush = CreateSolidBrush(ResolveBgColor(*sticker));
             FillRect(hdc, &client, brush);
             DeleteObject(brush);
 
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, GetTextColor(sticker->theme));
+            SetTextColor(hdc, ResolveTextColor(*sticker));
             if (sticker->font == nullptr) {
                 ApplyStickerFont(*sticker);
             }
@@ -1166,7 +1320,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
-    const DWORD exStyle = WS_EX_TOOLWINDOW | (sticker.theme == Theme::Transparent ? WS_EX_LAYERED : 0);
+    const DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
     HWND hwnd = CreateWindowExW(
         exStyle, kWindowClassName, L"LightSticker",
         WS_VISIBLE | WS_POPUP,
@@ -1182,7 +1336,9 @@ bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
     }
 
     ApplyStickerFont(sticker);
-    ApplyThemeWindowStyle(sticker);
+    D2DCreateRenderer(sticker.renderer, hwnd, DetectDpi(hwnd));
+    ApplyOpacity(sticker);
+    UpdateStickerWindowRgn(sticker);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     return true;
@@ -1205,6 +1361,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // Direct2D + DirectWrite. If init fails we still run, falling back to the
+    // GDI WM_PAINT branch.
+    D2DInit();
+
     LoadState();
 
     WNDCLASSEXW wc {};
@@ -1213,7 +1373,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    // Direct2D paints the entire client; the OS background brush would just
+    // flash through during resize.
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClassName;
     if (RegisterClassExW(&wc) == 0) {
         return 1;
@@ -1271,5 +1433,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    D2DShutdown();
     return static_cast<int>(msg.wParam);
 }

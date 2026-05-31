@@ -7,6 +7,7 @@ endif()
 
 set(LIGHTSTICKER_SOURCES
     src/main.cpp
+    src/d2d_renderer.cpp
 )
 
 if(WIN32)
@@ -23,4 +24,4 @@ if(MSVC)
     target_compile_options(LightSticker PRIVATE $<$<CONFIG:Release>:/O2>)
 endif()
 
-target_link_libraries(LightSticker PRIVATE user32 gdi32 shell32 ole32)
+target_link_libraries(LightSticker PRIVATE user32 gdi32 shell32 ole32 d2d1 dwrite)
