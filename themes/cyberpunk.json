@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "cyberpunk",
+  "name": "Cyberpunk",
+  "description": "Near-black slab with neon-green text. High contrast.",
+  "tokens": {
+    "bgColor": "#0A0F0E",
+    "textColor": "#39FF88",
+    "opacityPercent": 88,
+    "cornerRadius": 6
+  }
+}

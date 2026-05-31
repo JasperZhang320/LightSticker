@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "sakura",
+  "name": "Sakura",
+  "description": "Soft pink with warm-grey text -- cherry-blossom mood.",
+  "tokens": {
+    "bgColor": "#FFE4ED",
+    "textColor": "#3A1F2B",
+    "opacityPercent": 96,
+    "cornerRadius": 18
+  }
+}

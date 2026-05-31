@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "midnight",
+  "name": "Midnight",
+  "description": "Deep navy slab with soft white text. Pairs well with dark wallpapers.",
+  "tokens": {
+    "bgColor": "#0E1A2B",
+    "textColor": "#E8EEF7",
+    "opacityPercent": 92,
+    "cornerRadius": 16
+  }
+}

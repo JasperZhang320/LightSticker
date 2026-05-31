@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "sunny",
+  "name": "Sunny",
+  "description": "Pale yellow paper, like the original sticky note.",
+  "tokens": {
+    "bgColor": "#FFF8B0",
+    "textColor": "#141414",
+    "opacityPercent": 100,
+    "cornerRadius": 12
+  }
+}
