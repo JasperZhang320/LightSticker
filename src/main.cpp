@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"LightStickerMainWindow";
+constexpr wchar_t kHookWindowClassName[] = L"LightStickerShellHookWindow";
 constexpr wchar_t kGeneralSection[] = L"General";
 constexpr wchar_t kLegacySection[] = L"Sticker";
 constexpr UINT kMsgEndEdit = WM_APP + 1;
@@ -75,8 +77,9 @@ struct StickerState {
 
 struct AppState {
     std::wstring iniPath;
-    std::vector<StickerState> stickers;
+    std::vector<std::unique_ptr<StickerState>> stickers;
     HWND workerw = nullptr;
+    UINT taskbarCreatedMsg = 0;
     bool exiting = false;
 };
 
@@ -238,6 +241,28 @@ StickerState MakeDefaultSticker() {
     return sticker;
 }
 
+void ClampToNearestMonitor(StickerState& sticker) {
+    RECT rect{ sticker.x, sticker.y, sticker.x + sticker.w, sticker.y + sticker.h };
+    HMONITOR mon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    if (mon == nullptr) {
+        return;
+    }
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) {
+        return;
+    }
+    const RECT& wa = mi.rcWork;
+    const int waW = wa.right - wa.left;
+    const int waH = wa.bottom - wa.top;
+    sticker.w = std::min(sticker.w, std::max(waW, 140));
+    sticker.h = std::min(sticker.h, std::max(waH, 80));
+    if (sticker.x + sticker.w > wa.right)  sticker.x = wa.right  - sticker.w;
+    if (sticker.y + sticker.h > wa.bottom) sticker.y = wa.bottom - sticker.h;
+    if (sticker.x < wa.left) sticker.x = wa.left;
+    if (sticker.y < wa.top)  sticker.y = wa.top;
+}
+
 std::wstring StickerSectionName(int index) {
     return L"Sticker" + std::to_wstring(index);
 }
@@ -249,7 +274,8 @@ void LoadState() {
     g_app.stickers.clear();
 
     if (count > kMaxStickerCount) {
-        g_app.stickers.push_back(MakeDefaultSticker());
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
+        ClampToNearestMonitor(*g_app.stickers.back());
         return;
     }
 
@@ -264,7 +290,8 @@ void LoadState() {
         GetPrivateProfileStringW(kLegacySection, L"text", legacy.text.c_str(), textBuf,
                                  static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
         legacy.text = UnescapeIniValue(textBuf);
-        g_app.stickers.push_back(std::move(legacy));
+        ClampToNearestMonitor(legacy);
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(legacy)));
         return;
     }
 
@@ -284,11 +311,12 @@ void LoadState() {
         GetPrivateProfileStringW(section.c_str(), L"text", sticker.text.c_str(), textBuf,
                                  static_cast<DWORD>(std::size(textBuf)), g_app.iniPath.c_str());
         sticker.text = UnescapeIniValue(textBuf);
-        g_app.stickers.push_back(std::move(sticker));
+        ClampToNearestMonitor(sticker);
+        g_app.stickers.push_back(std::make_unique<StickerState>(std::move(sticker)));
     }
 
     if (g_app.stickers.empty()) {
-        g_app.stickers.push_back(MakeDefaultSticker());
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
     }
 }
 
@@ -304,7 +332,7 @@ void UpdatePositionFromWindow(StickerState& sticker) {
 
 void SaveAllState() {
     for (auto& sticker : g_app.stickers) {
-        UpdatePositionFromWindow(sticker);
+        UpdatePositionFromWindow(*sticker);
     }
 
     const UINT oldCount = GetPrivateProfileIntW(kGeneralSection, L"StickerCount", 0, g_app.iniPath.c_str());
@@ -317,7 +345,7 @@ void SaveAllState() {
     WritePrivateProfileStringW(kGeneralSection, L"StickerCount", std::to_wstring(g_app.stickers.size()).c_str(), g_app.iniPath.c_str());
 
     for (size_t i = 0; i < g_app.stickers.size(); ++i) {
-        const StickerState& sticker = g_app.stickers[i];
+        const StickerState& sticker = *g_app.stickers[i];
         const std::wstring section = StickerSectionName(static_cast<int>(i));
 
         WritePrivateProfileStringW(section.c_str(), L"x", std::to_wstring(sticker.x).c_str(), g_app.iniPath.c_str());
@@ -363,8 +391,8 @@ HWND FindWorkerW() {
 
 StickerState* FindStickerByHwnd(HWND hwnd) {
     for (auto& sticker : g_app.stickers) {
-        if (sticker.hwnd == hwnd) {
-            return &sticker;
+        if (sticker->hwnd == hwnd) {
+            return sticker.get();
         }
     }
     return nullptr;
@@ -372,25 +400,40 @@ StickerState* FindStickerByHwnd(HWND hwnd) {
 
 StickerState* FindStickerByEdit(HWND edit) {
     for (auto& sticker : g_app.stickers) {
-        if (sticker.edit == edit) {
-            return &sticker;
+        if (sticker->edit == edit) {
+            return sticker.get();
         }
     }
     return nullptr;
 }
 
-HFONT CreateStickerFont(const StickerState& sticker, HWND hwnd) {
+int DetectDpi(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr && hwnd != nullptr) {
+        using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+        auto fn = reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(user32, "GetDpiForWindow"));
+        if (fn != nullptr) {
+            const UINT dpi = fn(hwnd);
+            if (dpi != 0) {
+                return static_cast<int>(dpi);
+            }
+        }
+    }
     HDC hdc = GetDC(hwnd);
     bool releaseScreenDc = false;
     if (hdc == nullptr) {
         hdc = GetDC(nullptr);
         releaseScreenDc = true;
     }
-    const int dpi = hdc != nullptr ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+    int dpi = 96;
     if (hdc != nullptr) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
         ReleaseDC(releaseScreenDc ? nullptr : hwnd, hdc);
     }
+    return dpi > 0 ? dpi : 96;
+}
 
+HFONT CreateStickerFont(const StickerState& sticker, int dpi) {
     LOGFONTW lf {};
     lf.lfHeight = -MulDiv(FontSizeToPoint(sticker.fontSize), dpi, 72);
     lf.lfQuality = CLEARTYPE_QUALITY;
@@ -402,12 +445,15 @@ HFONT CreateStickerFont(const StickerState& sticker, HWND hwnd) {
     return CreateFontIndirectW(&lf);
 }
 
-void ApplyStickerFont(StickerState& sticker) {
+void ApplyStickerFont(StickerState& sticker, int dpi = 0) {
+    if (dpi <= 0) {
+        dpi = DetectDpi(sticker.hwnd);
+    }
     if (sticker.font != nullptr) {
         DeleteObject(sticker.font);
         sticker.font = nullptr;
     }
-    sticker.font = CreateStickerFont(sticker, sticker.hwnd);
+    sticker.font = CreateStickerFont(sticker, dpi);
     if (sticker.edit != nullptr && sticker.font != nullptr) {
         SendMessageW(sticker.edit, WM_SETFONT, reinterpret_cast<WPARAM>(sticker.font), TRUE);
     }
@@ -560,16 +606,44 @@ void AdjustSizeChoice(StickerState& sticker, int delta) {
 
 bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance);
 
+void ReattachStickerToWorkerW(StickerState& sticker) {
+    if (sticker.hwnd != nullptr && g_app.workerw != nullptr) {
+        SetParent(sticker.hwnd, g_app.workerw);
+    }
+}
+
+void RefreshAndReattachAll() {
+    g_app.workerw = FindWorkerW();
+    for (auto& sticker : g_app.stickers) {
+        ReattachStickerToWorkerW(*sticker);
+        if (sticker->hwnd != nullptr) {
+            // After Explorer restart the sticker may have been hidden.
+            ShowWindow(sticker->hwnd, SW_SHOW);
+            InvalidateRect(sticker->hwnd, nullptr, TRUE);
+        }
+    }
+}
+
+LRESULT CALLBACK ShellHookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_app.taskbarCreatedMsg != 0 && msg == g_app.taskbarCreatedMsg) {
+        RefreshAndReattachAll();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 void RemoveStickerByHwnd(HWND hwnd) {
     auto it = std::find_if(g_app.stickers.begin(), g_app.stickers.end(),
-                           [hwnd](const StickerState& s) { return s.hwnd == hwnd; });
+                           [hwnd](const std::unique_ptr<StickerState>& s) {
+                               return s != nullptr && s->hwnd == hwnd;
+                           });
     if (it == g_app.stickers.end()) {
         return;
     }
 
-    if (it->font != nullptr) {
-        DeleteObject(it->font);
-        it->font = nullptr;
+    if ((*it)->font != nullptr) {
+        DeleteObject((*it)->font);
+        (*it)->font = nullptr;
     }
     g_app.stickers.erase(it);
 }
@@ -600,15 +674,15 @@ void BeginExitAll() {
     g_app.exiting = true;
 
     for (auto& sticker : g_app.stickers) {
-        EndEdit(sticker, true);
+        EndEdit(*sticker, true);
     }
     SaveAllState();
 
     std::vector<HWND> windows;
     windows.reserve(g_app.stickers.size());
     for (const auto& sticker : g_app.stickers) {
-        if (sticker.hwnd != nullptr) {
-            windows.push_back(sticker.hwnd);
+        if (sticker->hwnd != nullptr) {
+            windows.push_back(sticker->hwnd);
         }
     }
 
@@ -630,13 +704,17 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         }
         break;
     case kMenuNewId: {
-        StickerState created = MakeDefaultSticker();
-        created.x = sticker->x + 30;
-        created.y = sticker->y + 30;
-        g_app.stickers.push_back(std::move(created));
-        StickerState& newest = g_app.stickers.back();
+        auto created = std::make_unique<StickerState>(MakeDefaultSticker());
+        created->x = sticker->x + 30;
+        created->y = sticker->y + 30;
+        ClampToNearestMonitor(*created);
+        // Snapshot pointer + instance BEFORE push_back, so subsequent
+        // window-creation calls do not depend on `sticker` (which may dangle
+        // if the vector reallocates).
+        StickerState* newPtr = created.get();
         HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-        if (!CreateStickerWindow(newest, instance)) {
+        g_app.stickers.push_back(std::move(created));
+        if (!CreateStickerWindow(*newPtr, instance)) {
             g_app.stickers.pop_back();
             return;
         }
@@ -644,17 +722,18 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         break;
     }
     case kMenuDuplicateId: {
-        StickerState duplicated = *sticker;
-        duplicated.hwnd = nullptr;
-        duplicated.edit = nullptr;
-        duplicated.editOrigProc = nullptr;
-        duplicated.font = nullptr;
-        duplicated.x += 30;
-        duplicated.y += 30;
-        g_app.stickers.push_back(std::move(duplicated));
-        StickerState& newest = g_app.stickers.back();
+        auto duplicated = std::make_unique<StickerState>(*sticker);
+        duplicated->hwnd = nullptr;
+        duplicated->edit = nullptr;
+        duplicated->editOrigProc = nullptr;
+        duplicated->font = nullptr;
+        duplicated->x += 30;
+        duplicated->y += 30;
+        ClampToNearestMonitor(*duplicated);
+        StickerState* newPtr = duplicated.get();
         HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-        if (!CreateStickerWindow(newest, instance)) {
+        g_app.stickers.push_back(std::move(duplicated));
+        if (!CreateStickerWindow(*newPtr, instance)) {
             g_app.stickers.pop_back();
             return;
         }
@@ -775,6 +854,15 @@ void ShowContextMenu(HWND hwnd, const StickerState& sticker, POINT pt) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     StickerState* sticker = FindStickerByHwnd(hwnd);
 
+    if (g_app.taskbarCreatedMsg != 0 && msg == g_app.taskbarCreatedMsg) {
+        // Explorer was restarted -- the WorkerW handle we stored is stale.
+        // Re-find WorkerW once and re-parent every sticker.
+        // Multiple stickers receive this broadcast, but successive calls are
+        // idempotent (SetParent with the same parent is a no-op).
+        RefreshAndReattachAll();
+        return 0;
+    }
+
     switch (msg) {
     case WM_NCHITTEST: {
         if (sticker == nullptr) {
@@ -793,8 +881,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 140;
-        mmi->ptMinTrackSize.y = 80;
+        const int dpi = DetectDpi(hwnd);
+        mmi->ptMinTrackSize.x = MulDiv(140, dpi, 96);
+        mmi->ptMinTrackSize.y = MulDiv(80, dpi, 96);
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        if (sticker != nullptr) {
+            const int newDpi = static_cast<int>(HIWORD(wParam));
+            ApplyStickerFont(*sticker, newDpi);
+            const RECT* sug = reinterpret_cast<const RECT*>(lParam);
+            if (sug != nullptr) {
+                SetWindowPos(hwnd, nullptr, sug->left, sug->top,
+                             sug->right - sug->left, sug->bottom - sug->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
         return 0;
     }
     case WM_MOVE:
@@ -908,6 +1011,20 @@ bool CreateStickerWindow(StickerState& sticker, HINSTANCE instance) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    // Best-effort: declare PerMonitor V2 DPI awareness at runtime as well.
+    // The embedded manifest is the canonical declaration; this is a fallback
+    // for environments where the manifest was stripped or is not honored.
+    {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32 != nullptr) {
+            using SetCtxFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+            auto setCtx = reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+            if (setCtx != nullptr) {
+                setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
+        }
+    }
+
     LoadState();
 
     WNDCLASSEXW wc {};
@@ -922,19 +1039,49 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    // Listen for the broadcast Explorer sends after a restart so we can
+    // re-attach our stickers to the new WorkerW handle.
+    g_app.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+
+    // Sticker windows become children of WorkerW and stop receiving broadcasts,
+    // so we register a hidden top-level window solely to listen for
+    // "TaskbarCreated" (i.e. Explorer restart).
+    WNDCLASSEXW hookWc {};
+    hookWc.cbSize = sizeof(hookWc);
+    hookWc.lpfnWndProc = ShellHookWndProc;
+    hookWc.hInstance = instance;
+    hookWc.lpszClassName = kHookWindowClassName;
+    RegisterClassExW(&hookWc);
+    HWND hookWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW, kHookWindowClassName, L"", WS_OVERLAPPED,
+        0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    if (hookWindow != nullptr && g_app.taskbarCreatedMsg != 0) {
+        // Required so we receive the broadcast even when running elevated
+        // alongside a non-elevated Explorer (UIPI).
+        using ChangeWindowMessageFilterExFn = BOOL(WINAPI*)(HWND, UINT, DWORD, void*);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        if (u != nullptr) {
+            auto fn = reinterpret_cast<ChangeWindowMessageFilterExFn>(
+                GetProcAddress(u, "ChangeWindowMessageFilterEx"));
+            if (fn != nullptr) {
+                fn(hookWindow, g_app.taskbarCreatedMsg, /*MSGFLT_ALLOW*/ 1, nullptr);
+            }
+        }
+    }
+
     g_app.workerw = FindWorkerW();
 
     bool createdAny = false;
     for (auto& sticker : g_app.stickers) {
-        if (CreateStickerWindow(sticker, instance)) {
+        if (CreateStickerWindow(*sticker, instance)) {
             createdAny = true;
         }
     }
 
     if (!createdAny) {
         g_app.stickers.clear();
-        g_app.stickers.push_back(MakeDefaultSticker());
-        if (!CreateStickerWindow(g_app.stickers.front(), instance)) {
+        g_app.stickers.push_back(std::make_unique<StickerState>(MakeDefaultSticker()));
+        if (!CreateStickerWindow(*g_app.stickers.front(), instance)) {
             return 1;
         }
     }
