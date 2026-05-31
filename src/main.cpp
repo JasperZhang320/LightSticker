@@ -40,6 +40,11 @@ constexpr UINT kMenuSizeSmallId = 1301;
 constexpr UINT kMenuSizeMediumId = 1302;
 constexpr UINT kMenuSizeLargeId = 1303;
 
+// Reserved range for dynamically-loaded theme packs (themes/*.json).
+// 1500..1599 gives room for ~100 packs, which is plenty.
+constexpr UINT kMenuThemePackBaseId  = 1500;
+constexpr UINT kMenuThemePackMaxId   = 1599;
+
 enum class Theme : int {
     Default = 0,
     Miku = 1,
@@ -699,6 +704,124 @@ ThemePreset GetThemePreset(Theme theme) {
     }
 }
 
+// ---- Theme packs (design tokens loaded from themes/*.json) ----------------
+
+struct ThemePack {
+    std::wstring id;
+    std::wstring name;
+    std::wstring description;
+    COLORREF     bgColor        = RGB(255, 248, 176);
+    COLORREF     textColor      = RGB(20, 20, 20);
+    int          opacityPercent = 100;
+    int          cornerRadius   = 12;
+};
+
+std::vector<ThemePack> g_themePacks;
+
+bool ParseHexColor(const std::string& s, COLORREF& out) {
+    if (s.size() != 7 || s[0] != '#') return false;
+    unsigned v = 0;
+    for (size_t i = 1; i < 7; ++i) {
+        const char c = s[i];
+        v <<= 4;
+        if      (c >= '0' && c <= '9') v |= static_cast<unsigned>(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= static_cast<unsigned>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= static_cast<unsigned>(c - 'A' + 10);
+        else return false;
+    }
+    out = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    return true;
+}
+
+bool LoadThemePackFromFile(const std::wstring& path, ThemePack& out) {
+    std::string buf;
+    if (!ReadEntireFile(path, buf)) return false;
+    json_min::Value root;
+    if (!json_min::parse(buf, root) || root.type != json_min::Value::Type::Obj) return false;
+
+    if (auto* p = root.find("schemaVersion"); p == nullptr || p->as_int(0) != 1) {
+        return false;
+    }
+    auto* idP = root.find("id");
+    auto* nameP = root.find("name");
+    if (idP == nullptr || idP->type != json_min::Value::Type::Str || idP->s.empty()) return false;
+    if (nameP == nullptr || nameP->type != json_min::Value::Type::Str || nameP->s.empty()) return false;
+
+    out = ThemePack{};
+    out.id   = Utf8ToUtf16(idP->s);
+    out.name = Utf8ToUtf16(nameP->s);
+    if (auto* p = root.find("description"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        out.description = Utf8ToUtf16(p->s);
+    }
+
+    const json_min::Value* tokens = root.find("tokens");
+    if (tokens == nullptr || tokens->type != json_min::Value::Type::Obj) return false;
+
+    if (auto* p = tokens->find("bgColor"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        if (!ParseHexColor(p->s, out.bgColor)) return false;
+    }
+    if (auto* p = tokens->find("textColor"); p != nullptr && p->type == json_min::Value::Type::Str) {
+        if (!ParseHexColor(p->s, out.textColor)) return false;
+    }
+    if (auto* p = tokens->find("opacityPercent"); p != nullptr) {
+        out.opacityPercent = std::clamp(static_cast<int>(p->as_int(100)),
+                                        kMinOpacityPercent, 100);
+    }
+    if (auto* p = tokens->find("cornerRadius"); p != nullptr) {
+        out.cornerRadius = std::clamp(static_cast<int>(p->as_int(12)),
+                                      0, kMaxCornerRadius);
+    }
+    return true;
+}
+
+void LoadThemePacksFromDirectory(const std::wstring& dir) {
+    if (dir.empty()) return;
+    const std::wstring pattern = dir + L"\\*.json";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring full = dir + L"\\" + fd.cFileName;
+        ThemePack pack;
+        if (!LoadThemePackFromFile(full, pack)) continue;
+        // Deduplicate: replace any existing pack with the same id (later
+        // directories win, matching the docs).
+        auto it = std::find_if(g_themePacks.begin(), g_themePacks.end(),
+                               [&](const ThemePack& tp) { return tp.id == pack.id; });
+        if (it != g_themePacks.end()) {
+            *it = std::move(pack);
+        } else {
+            g_themePacks.push_back(std::move(pack));
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+void LoadAllThemePacks() {
+    g_themePacks.clear();
+    // 1) Portable / EXE-adjacent.
+    LoadThemePacksFromDirectory(GetModuleDirectory() + L"\\themes");
+    // 2) Per-user override.
+    PWSTR localAppData = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData))) {
+        std::wstring dir(localAppData);
+        CoTaskMemFree(localAppData);
+        dir += L"\\LightSticker\\themes";
+        LoadThemePacksFromDirectory(dir);
+    }
+    // Stable menu order regardless of FS enumeration order.
+    std::sort(g_themePacks.begin(), g_themePacks.end(),
+              [](const ThemePack& a, const ThemePack& b) { return a.name < b.name; });
+}
+
+void ApplyThemePack(StickerState& sticker, const ThemePack& pack) {
+    sticker.customBgColor   = static_cast<int>(pack.bgColor);
+    sticker.customTextColor = static_cast<int>(pack.textColor);
+    sticker.opacityPercent  = std::clamp(pack.opacityPercent, kMinOpacityPercent, 100);
+    sticker.cornerRadius    = std::clamp(pack.cornerRadius, 0, kMaxCornerRadius);
+}
+
 COLORREF ResolveBgColor(const StickerState& s) {
     if (s.customBgColor != kCustomColorUnset) {
         return static_cast<COLORREF>(s.customBgColor);
@@ -1089,6 +1212,14 @@ void HandleMenuCommand(HWND hwnd, UINT cmd) {
         BeginExitAll();
         break;
     default:
+        if (cmd >= kMenuThemePackBaseId && cmd <= kMenuThemePackMaxId) {
+            const size_t idx = cmd - kMenuThemePackBaseId;
+            if (idx < g_themePacks.size()) {
+                ApplyThemePack(*sticker, g_themePacks[idx]);
+                ApplyThemeWindowStyle(*sticker);
+                SaveAllState();
+            }
+        }
         break;
     }
 }
@@ -1111,6 +1242,22 @@ void ShowContextMenu(HWND hwnd, const StickerState& sticker, POINT pt) {
     AppendMenuW(themeMenu, MF_STRING | (sticker.theme == Theme::Miku ? MF_CHECKED : 0), kMenuThemeMikuId, L"Miku");
     AppendMenuW(themeMenu, MF_STRING | (sticker.theme == Theme::Transparent ? MF_CHECKED : 0), kMenuThemeTransparentId,
                 L"Transparent");
+
+    if (!g_themePacks.empty()) {
+        AppendMenuW(themeMenu, MF_SEPARATOR, 0, nullptr);
+        // Active-pack detection: a pack is "active" when both colours match
+        // exactly. The user could of course tweak custom colours by hand
+        // (future feature) and lose the checkmark, which is fine.
+        for (size_t i = 0; i < g_themePacks.size(); ++i) {
+            const ThemePack& pack = g_themePacks[i];
+            const bool active =
+                sticker.customBgColor   == static_cast<int>(pack.bgColor)   &&
+                sticker.customTextColor == static_cast<int>(pack.textColor);
+            const UINT id = kMenuThemePackBaseId + static_cast<UINT>(i);
+            if (id > kMenuThemePackMaxId) break;
+            AppendMenuW(themeMenu, MF_STRING | (active ? MF_CHECKED : 0), id, pack.name.c_str());
+        }
+    }
 
     AppendMenuW(fontMenu, MF_STRING | (sticker.fontChoice == FontChoice::Default ? MF_CHECKED : 0), kMenuFontDefaultId, L"Default");
     AppendMenuW(fontMenu, MF_STRING | (sticker.fontChoice == FontChoice::Consolas ? MF_CHECKED : 0), kMenuFontConsolasId,
@@ -1366,6 +1513,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     D2DInit();
 
     LoadState();
+    LoadAllThemePacks();
 
     WNDCLASSEXW wc {};
     wc.cbSize = sizeof(wc);

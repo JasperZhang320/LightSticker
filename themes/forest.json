@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "forest",
+  "name": "Forest",
+  "description": "Muted sage green with deep-evergreen text.",
+  "tokens": {
+    "bgColor": "#D6E4D2",
+    "textColor": "#1F3A26",
+    "opacityPercent": 100,
+    "cornerRadius": 14
+  }
+}

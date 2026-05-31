@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "vintage-paper",
+  "name": "Vintage Paper",
+  "description": "Cream paper with sepia ink, lightly off-white.",
+  "tokens": {
+    "bgColor": "#F5ECD7",
+    "textColor": "#4A331A",
+    "opacityPercent": 100,
+    "cornerRadius": 4
+  }
+}
